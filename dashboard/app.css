@@ -91,6 +91,10 @@ td.num, th.num { text-align: right; }
 .status { font-size: 12.5px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
 .status.live { color: var(--pos); border-color: rgba(52, 211, 153, .4); }
 .implied { display: flex; align-items: center; gap: 9px; justify-content: flex-end; }
+.implied-col { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+.implied-col .sub { white-space: nowrap; }
+.valid .facts { margin: 4px 0 12px; }
+.valid .fact { background: #0a0f1c; }
 .implied .bar { width: 74px; height: 7px; background: var(--line); border-radius: 99px; overflow: hidden; flex: none; }
 .implied .bar i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent-dim), var(--accent)); border-radius: 99px; }
 .empty { padding: 40px 24px; text-align: center; }

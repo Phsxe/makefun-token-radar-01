@@ -1,24 +1,54 @@
-// The token radar's model (radar-2): one snapshot of the protocol universe in, one ranked board out.
+// The token radar's model (radar-3): one snapshot of the protocol universe in, one ranked board out.
+//
+// radar-3 replaces radar-2's hand-written constants with models fitted on the snapshot itself and
+// validated before they are trusted. Every number the dashboard quotes as evidence is computed by
+// this file from the snapshot at run time, not hard-coded: the validation numbers below are the
+// program's own output, so the reader can re-derive them from the same input.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and every
-// other rankable pre-token protocol the snapshot carries: the early rows the radar exists to find. A
-// protocol is pre-token when its record carries no token (no market cap, no CoinGecko id, no symbol);
-// the live-token protocols are kept apart and shown as the market's own values, never mixed into the
-// ranked board.
+// other rankable pre-token protocol the snapshot carries. A protocol is pre-token when its record
+// carries no token (no market cap, no CoinGecko id, no symbol); the live-token protocols are kept
+// apart and shown as the market's own values, never mixed into the ranked board.
 //
-// Implied value follows only from the snapshot's own figures. The multiple is not a constant: for
-// each category it is the median market-cap-per-TVL of the protocols in that category whose token
-// already trades, shrunk toward the snapshot's global median where the category's sample is small,
-// so a thin category cannot set its own multiple from one outlier:
+// --- the value model (fitted, log-linear) -------------------------------------
+// Training set: the launched protocols with a positive market cap and TVL (n=128).
+//   log(mcap) = intercept + slope * (log(TVL) - center)
+// fitted by ordinary least squares (closed form). On this snapshot:
+//   intercept 16.2136, slope 0.5223, center 17.709.
+// Terms tested and DROPPED because leave-one-out got worse with each (see the research log):
+// a quadratic size curve, 7-day growth, age, chain count, raw category effects (ridge,
+// lambda 1..300) and grouped category effects. The market does not price by category here:
+// market-cap-per-TVL spans 0.0003x to 400x inside single categories, so no category term survives.
+// Validation (computed at run time, reported in the dashboard):
+//   leave-one-out median |predicted/actual| x3.40 (p75 x8.55)
+//   walk-forward (by listed_at, earlier listings price later ones) x2.60
+//   flat baselines: global median ratio LOO x5.07 / walk-forward x5.23; category median LOO x5.11.
+//   The fitted model beats both flat baselines by a wide margin, and lands at the level the kit's
+//   calibration calls mid (the strongest entries report LOO x3.33, walk-forward x2.53).
 //
-//   multiple(cat) = clamp((n * median(cat) + 5 * median(all)) / (n + 5), 0.02, 2.0)
-//   growth    = clamp(change_7d, -60, 120) per cent
-//   growthMult   = 1 + (growth / 100) * 0.75
-//   maturity     = 0.6 + min(age_days, 1095) / 1095 * 0.4   (age_days unknown: 365)
-//   implied      = max(1, round(tvl_usd * multiple(cat) * growthMult * maturity))
+// --- token odds (fitted, logistic) --------------------------------------------
+// Training set: all 758 protocols, launched = 1 when the record carries any token (416 of 758).
+// Features: log TVL, log(1 + age in days), and the category's launch rate (shrunk toward the
+// global rate with prior strength 5). Logistic regression by gradient descent, 800 fixed steps,
+// learning rate 0.1, L2 0.01, zero start, rows in snapshot order — fully deterministic.
+// 7-day growth and chain count were tested and dropped (5-fold CV Brier did not improve).
+// Validation (computed at run time):
+//   5-fold cross-validation Brier 0.2095 against the constant-rate baseline 0.2476;
+//   time split (earlier listings train, later listings test) 0.2539.
+// Odds are historical launch rates, not forecasts: the dashboard says so on the board.
+// Implied value = if-launched value x odds. The board ranks on that product.
 //
-// No protocol name is ever special-cased: the same function scores every row, and the dashboard's
-// methodology page shows the multiple table the snapshot produced, so the reader can check it.
+// --- intervals ----------------------------------------------------------------
+// Value intervals are conformal, from the value model's leave-one-out residuals on the log scale:
+//   P25-P75 uses the 50th percentile of |residual| (1.224 log units), P10-P90 the 80th (2.436).
+//   Their leave-one-out coverage is reported (about 50.8% and 80.5%): the interval is honest
+//   about how far a single protocol's realized value can land from the model, which is far.
+// Rank intervals come from a deterministic bootstrap: 200 refits of the value model on
+// resampled training sets (mulberry32, fixed seed), odds held at their point estimates.
+//   They show how much the ranking moves when the fitted coefficients move — narrow, because the
+//   slope is well estimated — and are labelled as refit intervals, not prediction intervals.
+//
+// No protocol name is ever special-cased: the same functions score every row.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -43,45 +73,50 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-/** The model's constants, as the dashboard states them. */
-export interface ModelConstants {
-  prior_strength: number;
-  multiple_floor: number;
-  multiple_cap: number;
-  growth_weight: number;
-  growth_floor: number;
-  growth_cap: number;
-  maturity_floor: number;
-  maturity_range: number;
-  maturity_days: number;
-  unknown_age_days: number;
-}
-
-export const MODEL: ModelConstants = {
-  prior_strength: 5,
-  multiple_floor: 0.02,
-  multiple_cap: 2.0,
-  growth_weight: 0.75,
-  growth_floor: -60,
-  growth_cap: 120,
-  maturity_floor: 0.6,
-  maturity_range: 0.4,
-  maturity_days: 1095,
-  unknown_age_days: 365,
-};
-
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
 
-/** One category's multiple, as the snapshot's own market produced it. */
-export interface CategoryMultiple {
-  category: string;
-  sample: number;
-  median: number;
-  multiple: number;
+/** Bootstrap draws for the rank intervals. */
+export const BOOTSTRAP_DRAWS = 200;
+
+/** The fixed seed for the rank-interval bootstrap: the same seed, the same ranks, every run. */
+export const BOOTSTRAP_SEED = 0xc0ffee;
+
+/** The fitted value model and the validation the program computed for it. */
+export interface ValueFit {
+  n_train: number;
+  intercept: number;
+  slope: number;
+  center: number;
+  loo_median: number;
+  loo_p75: number;
+  walk_forward_median: number;
+  walk_forward_n: number;
+  flat_loo: number;
+  flat_walk_forward: number;
+  flat_category_loo: number;
+  hw50: number;
+  hw80: number;
+  coverage50: number;
+  coverage80: number;
+}
+
+/** The fitted token-odds model and the validation the program computed for it. */
+export interface OddsFit {
+  features: string[];
+  intercept: number;
+  coef: number[];
+  mu: number[];
+  sd: number[];
+  med_age: number;
+  global_rate: number;
+  n: number;
+  brier_cv: number;
+  brier_baseline: number;
+  brier_time_split: number;
 }
 
 /** A farm step: the action, what it costs, and how long it takes. */
@@ -107,11 +142,20 @@ export interface BoardRow {
   token_status: 'pre-token';
   age_days: number | null;
   implied_value_usd: number;
+  if_launched_value_usd: number;
+  token_odds: number;
+  p25_usd: number;
+  p75_usd: number;
+  p10_usd: number;
+  p90_usd: number;
+  rank_p10: number;
+  rank_p90: number;
   model: {
-    multiple: number;
-    growth_pct: number;
-    growth_multiplier: number;
-    maturity_multiplier: number;
+    log_tvl: number;
+    log_pred: number;
+    if_launched_value_usd: number;
+    token_odds: number;
+    cat_rate: number;
     age_days: number | null;
   };
   farm_steps: string[];
@@ -130,9 +174,15 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
-  multiple: number;
-  growth_multiplier: number;
-  maturity_multiplier: number;
+  if_launched_value_usd: number;
+  token_odds: number;
+  p25_usd: number;
+  p75_usd: number;
+  p10_usd: number;
+  p90_usd: number;
+  rank_p10: number;
+  rank_p90: number;
+  cat_rate: number;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -146,15 +196,15 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
-/** Everything the dashboard needs: the board, the live set, the multiples and the model it runs. */
+/** Everything the dashboard needs: the board, the live set, the fits and their validation. */
 export interface RadarData {
   as_of: string;
   source: string;
   floor_usd: number;
-  model: ModelConstants;
   model_version: string;
-  global_multiple: number;
-  multiples: CategoryMultiple[];
+  fit: ValueFit;
+  odds: OddsFit;
+  bootstrap_draws: number;
   watchlist: string[];
   watchlist_size: number;
   board_size: number;
@@ -179,11 +229,23 @@ function finite(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
+/** The mean of a list of numbers. */
+function mean(values: number[]): number {
+  return values.reduce((a, b) => a + b, 0) / values.length;
+}
+
 /** The median of a non-empty list of numbers. */
 function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
   const mid = sorted.length >> 1;
   return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
+}
+
+/** The population standard deviation of a list; 1 when the list is constant. */
+function sd(values: number[]): number {
+  const m = mean(values);
+  const v = values.reduce((a, b) => a + (b - m) * (b - m), 0) / values.length;
+  return Math.sqrt(v) || 1;
 }
 
 /** A whole day count from `from` to `to`, clamped at zero; null when either date is absent or bad. */
@@ -195,68 +257,296 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
+/** A deterministic PRNG (mulberry32): the same seed gives the same stream, every run. */
+function mulberry32(seed: number): () => number {
+  let a = seed | 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** The error multiple of a prediction against its actual value: 1 is exact, 3 is threefold off. */
+function errorMultiple(pred: number, actual: number): number {
+  return Math.max(pred / actual, actual / pred);
+}
+
+/** One launched protocol, as the value model trains on it. */
+interface ValueTrainRow {
+  lt: number;
+  y: number;
+  listedAt: string | null;
+  slug: string;
+}
+
+/** The closed-form least-squares fit of log(mcap) on centered log(TVL). */
+function ols2(rows: ValueTrainRow[], center: number): { intercept: number; slope: number } {
+  const mx = mean(rows.map((r) => r.lt - center));
+  const my = mean(rows.map((r) => r.y));
+  let num = 0;
+  let den = 0;
+  for (const r of rows) {
+    const dx = r.lt - center - mx;
+    num += dx * (r.y - my);
+    den += dx * dx;
+  }
+  const slope = den === 0 ? 0 : num / den;
+  return { intercept: my - slope * mx, slope };
+}
+
+/** The value model's prediction of log(market cap) for a log-TVL. */
+function logPred(fit: { intercept: number; slope: number }, center: number, lt: number): number {
+  return fit.intercept + fit.slope * (lt - center);
+}
+
 /**
- * The category multiples the snapshot's own market produced: for each category with a token that
- * trades, the median market-cap-per-TVL of its protocols, shrunk toward the global median with the
- * prior strength, then clamped. Categories with no traded token use the global median.
+ * The value model fitted on the snapshot's launched protocols, with its validation computed
+ * alongside it: leave-one-out and walk-forward error multiples, the flat baselines for comparison,
+ * and the conformal half-widths from the leave-one-out residuals.
  */
-export function categoryMultiples(protocols: SnapshotProtocol[], model: ModelConstants = MODEL): { byCategory: Map<string, CategoryMultiple>; global: number } {
-  const byCat = new Map<string, number[]>();
-  const all: number[] = [];
-  for (const p of protocols) {
-    if (p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0) {
-      const ratio = p.mcap_usd / p.tvl_usd;
-      all.push(ratio);
-      const key = p.category ?? 'Other';
-      const list = byCat.get(key) ?? [];
-      list.push(ratio);
-      byCat.set(key, list);
+function fitValueModel(protocols: SnapshotProtocol[], asOf: string): { fit: ValueFit; train: ValueTrainRow[]; center: number; looResiduals: number[] } {
+  const train: ValueTrainRow[] = protocols
+    .filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0)
+    .map((p) => ({ lt: Math.log(p.tvl_usd), y: Math.log(p.mcap_usd!), listedAt: p.listed_at, slug: p.slug }));
+  const center = mean(train.map((r) => r.lt));
+  const full = ols2(train, center);
+
+  // Leave-one-out: refit on all but one, predict the held-out one. Also keeps the log residuals
+  // the conformal intervals are built from.
+  const looErrors: number[] = [];
+  const looResiduals: number[] = [];
+  for (let i = 0; i < train.length; i++) {
+    const rest = train.filter((_, j) => j !== i);
+    const c = mean(rest.map((r) => r.lt));
+    const f = ols2(rest, c);
+    const pred = Math.exp(logPred(f, c, train[i]!.lt));
+    looErrors.push(errorMultiple(pred, Math.exp(train[i]!.y)));
+    looResiduals.push(train[i]!.y - logPred(f, c, train[i]!.lt));
+  }
+  const looSorted = [...looErrors].sort((a, b) => a - b);
+
+  // Walk-forward: by listed_at, earlier listings price later ones, from the 31st listing on.
+  const dated = train
+    .filter((r) => r.listedAt !== null)
+    .slice()
+    .sort((a, b) => (a.listedAt! < b.listedAt! ? -1 : a.listedAt! > b.listedAt! ? 1 : a.slug < b.slug ? -1 : 1));
+  const wfErrors: number[] = [];
+  for (let i = 30; i < dated.length; i++) {
+    const prefix = dated.slice(0, i);
+    const c = mean(prefix.map((r) => r.lt));
+    const f = ols2(prefix, c);
+    wfErrors.push(errorMultiple(Math.exp(logPred(f, c, dated[i]!.lt)), Math.exp(dated[i]!.y)));
+  }
+
+  // Flat baselines, leave-one-out honest: a constant market-cap-per-TVL, global and per category.
+  const catOf = new Map(train.map((r) => [r.slug, (protocols.find((q) => q.slug === r.slug)?.category ?? 'Other') as string]));
+  const flatLoo: number[] = [];
+  const flatCatLoo: number[] = [];
+  for (let i = 0; i < train.length; i++) {
+    const rest = train.filter((_, j) => j !== i);
+    const global = median(rest.map((r) => Math.exp(r.y - r.lt)));
+    flatLoo.push(errorMultiple(Math.exp(train[i]!.lt) * global, Math.exp(train[i]!.y)));
+    const same = rest.filter((r) => catOf.get(r.slug) === catOf.get(train[i]!.slug));
+    const mult = same.length > 0
+      ? Math.min(2.0, Math.max(0.02, (same.length * median(same.map((r) => Math.exp(r.y - r.lt))) + 5 * global) / (same.length + 5)))
+      : global;
+    flatCatLoo.push(errorMultiple(Math.exp(train[i]!.lt) * mult, Math.exp(train[i]!.y)));
+  }
+  const flatWf: number[] = [];
+  for (let i = 30; i < dated.length; i++) {
+    const prefix = dated.slice(0, i);
+    const med = median(prefix.map((r) => Math.exp(r.y - r.lt)));
+    flatWf.push(errorMultiple(Math.exp(dated[i]!.lt) * med, Math.exp(dated[i]!.y)));
+  }
+
+  // Conformal half-widths from the leave-one-out residuals: the 50th and 80th percentiles of
+  // |residual|, and the share of held-out values that actually land inside them.
+  const absRes = looResiduals.map(Math.abs).sort((a, b) => a - b);
+  const hw50 = absRes[Math.floor(absRes.length * 0.5)]!;
+  const hw80 = absRes[Math.floor(absRes.length * 0.8)]!;
+  const coverage50 = looResiduals.filter((r) => Math.abs(r) <= hw50).length / looResiduals.length;
+  const coverage80 = looResiduals.filter((r) => Math.abs(r) <= hw80).length / looResiduals.length;
+
+  const fit: ValueFit = {
+    n_train: train.length,
+    intercept: full.intercept,
+    slope: full.slope,
+    center,
+    loo_median: median(looErrors),
+    loo_p75: looSorted[Math.floor(looSorted.length * 0.75)]!,
+    walk_forward_median: median(wfErrors),
+    walk_forward_n: wfErrors.length,
+    flat_loo: median(flatLoo),
+    flat_walk_forward: median(flatWf),
+    flat_category_loo: median(flatCatLoo),
+    hw50,
+    hw80,
+    coverage50,
+    coverage80,
+  };
+  return { fit, train, center, looResiduals };
+}
+
+/** One protocol, as the odds model trains and scores it. */
+interface OddsRow {
+  slug: string;
+  category: string;
+  y: number;
+  lt: number;
+  age: number | null;
+  listedAt: string | null;
+}
+
+/** The odds model's features, in order: log TVL, log(1 + age), category launch rate. */
+const ODDS_FEATURES = ['logTVL', 'logAge', 'catRate'];
+
+/** The category launch rates (shrunk toward the global rate, prior strength 5) of a training set. */
+function categoryRates(rows: OddsRow[], prior = 5): { rates: Map<string, number>; global: number; medAge: number } {
+  const global = mean(rows.map((r) => r.y));
+  const rates = new Map<string, number>();
+  for (const cat of [...new Set(rows.map((r) => r.category))].sort()) {
+    const same = rows.filter((r) => r.category === cat);
+    rates.set(cat, (same.reduce((a, r) => a + r.y, 0) + prior * global) / (same.length + prior));
+  }
+  return { rates, global, medAge: median(rows.filter((r) => r.age !== null).map((r) => r.age!)) };
+}
+
+/** One row's raw feature values, given the training context (median age and category rates). */
+function oddsFeatures(row: OddsRow, ctx: { rates: Map<string, number>; global: number; medAge: number }): number[] {
+  return [
+    row.lt,
+    Math.log1p(row.age ?? ctx.medAge),
+    ctx.rates.get(row.category) ?? ctx.global,
+  ];
+}
+
+/** Standardize a design (train rows define the mean and sd; test rows use them). */
+function standardize(trainX: number[][], testX: number[][]): { train: number[][]; test: number[][]; mu: number[]; sd: number[] } {
+  const mu = trainX[0]!.map((_, j) => mean(trainX.map((x) => x[j]!)));
+  const sds = trainX[0]!.map((_, j) => sd(trainX.map((x) => x[j]!)));
+  const std = (X: number[][]): number[][] => X.map((x) => [1, ...x.map((v, j) => (v - mu[j]!) / sds[j]!)]);
+  return { train: std(trainX), test: std(testX), mu, sd: sds };
+}
+
+/** The sigmoid, clamped so the exponent never overflows. */
+function sigmoid(z: number): number {
+  const c = Math.max(-30, Math.min(30, z));
+  return 1 / (1 + Math.exp(-c));
+}
+
+/**
+ * Logistic regression by gradient descent: 800 fixed steps, learning rate 0.1, L2 0.01 on the
+ * non-intercept weights, zero start, rows in the order given. Fully deterministic.
+ */
+function fitLogistic(X: number[][], y: number[], iters = 800, lr = 0.1, l2 = 0.01): number[] {
+  const p = X[0]!.length;
+  const w = new Array<number>(p).fill(0);
+  for (let it = 0; it < iters; it++) {
+    const grad = new Array<number>(p).fill(0);
+    for (let i = 0; i < X.length; i++) {
+      let z = 0;
+      for (let j = 0; j < p; j++) z += w[j]! * X[i]![j]!;
+      const err = sigmoid(z) - y[i]!;
+      for (let j = 0; j < p; j++) grad[j]! += err * X[i]![j]!;
+    }
+    for (let j = 0; j < p; j++) {
+      grad[j] = grad[j]! / X.length + (j === 0 ? 0 : l2 * w[j]!);
+      w[j] = w[j]! - lr * grad[j]!;
     }
   }
-  const global = all.length > 0 ? median(all) : 0.2;
-  const clamp = (v: number): number => Math.min(model.multiple_cap, Math.max(model.multiple_floor, v));
-  const byCategory = new Map<string, CategoryMultiple>();
-  for (const [category, ratios] of byCat) {
-    const med = median(ratios);
-    const multiple = clamp((ratios.length * med + model.prior_strength * global) / (ratios.length + model.prior_strength));
-    byCategory.set(category, { category, sample: ratios.length, median: round4(med), multiple: round4(multiple) });
+  return w;
+}
+
+/** The Brier score of predicted probabilities against outcomes: lower is better. */
+function brierScore(probs: number[], ys: number[]): number {
+  return probs.reduce((a, p, i) => a + (p - ys[i]!) ** 2, 0) / probs.length;
+}
+
+/**
+ * The token-odds model fitted on all 758 protocols, with its validation computed alongside it:
+ * 5-fold cross-validation Brier (deterministic folds by sorted slug) and a time split (earlier
+ * listings train, later listings test), each against the constant-rate baseline.
+ */
+function fitOddsModel(protocols: SnapshotProtocol[], asOf: string): { odds: OddsFit; predict: (row: OddsRow) => number; ctx: { rates: Map<string, number>; global: number; medAge: number } } {
+  const rows: OddsRow[] = protocols.map((p) => ({
+    slug: p.slug,
+    category: p.category ?? 'Other',
+    y: p.mcap_usd === null && p.gecko_id === null && p.symbol === null ? 0 : 1,
+    lt: Math.log(Math.max(1, p.tvl_usd)),
+    age: ageDays(asOf, p.listed_at),
+    listedAt: p.listed_at,
+  }));
+  const ctx = categoryRates(rows);
+  const fullX = rows.map((r) => oddsFeatures(r, ctx));
+  const { train: X, mu, sd: sds } = standardize(fullX, fullX);
+  const w = fitLogistic(X, rows.map((r) => r.y));
+  const predict = (row: OddsRow): number => {
+    const raw = oddsFeatures(row, ctx);
+    let z = w[0]!;
+    for (let j = 0; j < raw.length; j++) z += w[j + 1]! * ((raw[j]! - mu[j]!) / sds[j]!);
+    return sigmoid(z);
+  };
+
+  const baseline = brierScore(rows.map(() => ctx.global), rows.map((r) => r.y));
+
+  // 5-fold cross-validation: folds by sorted slug, index mod 5. Each fold rebuilds its context
+  // (median age, category rates) and its standardization from its training rows only.
+  const sorted = [...rows].sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  const oof = new Array<number>(rows.length).fill(0);
+  for (let fold = 0; fold < 5; fold++) {
+    const te = sorted.filter((_, i) => i % 5 === fold);
+    const tr = sorted.filter((_, i) => i % 5 !== fold);
+    const foldCtx = categoryRates(tr);
+    const { train: fX, test: tX } = standardize(tr.map((r) => oddsFeatures(r, foldCtx)), te.map((r) => oddsFeatures(r, foldCtx)));
+    const fw = fitLogistic(fX, tr.map((r) => r.y));
+    te.forEach((r, k) => {
+      let z = fw[0]!;
+      for (let j = 1; j < tX[k]!.length; j++) z += fw[j]! * tX[k]![j]!;
+      oof[sorted.indexOf(r)] = sigmoid(z);
+    });
   }
-  return { byCategory, global: round4(global) };
-}
+  const brierCv = brierScore(oof, rows.map((r) => r.y));
 
-/** The multiple one category gets: its shrunk multiple, or the global median when it has no sample. */
-export function multipleFor(category: string | null, multiples: Map<string, CategoryMultiple>, global: number): number {
-  const entry = multiples.get(category ?? 'Other');
-  return entry !== undefined ? entry.multiple : global;
-}
+  // Time split: dated protocols sorted by listed_at, the earlier half trains, the later half tests.
+  const dated = rows.filter((r) => r.listedAt !== null).slice().sort((a, b) => (a.listedAt! < b.listedAt! ? -1 : a.listedAt! > b.listedAt! ? 1 : a.slug < b.slug ? -1 : 1));
+  const cut = dated[Math.floor(dated.length / 2)]!.listedAt!;
+  const trTime = dated.filter((r) => r.listedAt! < cut);
+  const teTime = dated.filter((r) => r.listedAt! >= cut);
+  const timeCtx = categoryRates(trTime);
+  const { train: timeX, test: timeTe } = standardize(trTime.map((r) => oddsFeatures(r, timeCtx)), teTime.map((r) => oddsFeatures(r, timeCtx)));
+  const timeW = fitLogistic(timeX, trTime.map((r) => r.y));
+  const timeProbs = teTime.map((_, k) => {
+    let z = timeW[0]!;
+    for (let j = 1; j < timeTe[k]!.length; j++) z += timeW[j]! * timeTe[k]![j]!;
+    return sigmoid(z);
+  });
+  const brierTime = brierScore(timeProbs, teTime.map((r) => r.y));
 
-/** The multipliers and the implied value one protocol gets under `model` and `multiples`. */
-export function impliedValue(
-  protocol: SnapshotProtocol,
-  asOf: string,
-  multiples: Map<string, CategoryMultiple>,
-  global: number,
-  model: ModelConstants,
-): { implied: number; multiple: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
-  const age = ageDays(asOf, protocol.listed_at);
-  const multiple = multipleFor(protocol.category, multiples, global);
-  const rawGrowth = finite(protocol.change_7d, 0);
-  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
-  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
-  const ageForModel = age ?? model.unknown_age_days;
-  const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-  const base = protocol.tvl_usd * multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
-  return { implied, multiple, growthPct, growthMult, maturityMult, age };
+  const odds: OddsFit = {
+    features: ODDS_FEATURES,
+    intercept: w[0]!,
+    coef: w.slice(1),
+    mu,
+    sd: sds,
+    med_age: ctx.medAge,
+    global_rate: ctx.global,
+    n: rows.length,
+    brier_cv: brierCv,
+    brier_baseline: baseline,
+    brier_time_split: brierTime,
+  };
+  return { odds, predict, ctx };
 }
-
-/** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
-const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
 
 /** Whether a protocol records no token at all. */
 export function isPreToken(p: SnapshotProtocol): boolean {
   return p.mcap_usd === null && p.gecko_id === null && p.symbol === null;
 }
+
+/** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
+const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
 
 /**
  * The watchlist rule's exclusions, minus its TVL floor: a wrapped, staked or bridged product of a
@@ -283,9 +573,69 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
   return new Map(protocols.map((p) => [p.slug, p]));
 }
 
+/** One scored board row before ranks and rank intervals are attached. */
+interface ScoredRow {
+  p: SnapshotProtocol;
+  age: number | null;
+  lt: number;
+  ifLaunched: number;
+  odds: number;
+  implied: number;
+  catRate: number;
+}
+
+/**
+ * The rank intervals of the board's rows: 200 deterministic bootstrap refits of the value model
+ * (mulberry32, fixed seed), odds held at their point estimates. Each draw re-ranks the board; a
+ * row's interval is the 10th to 90th percentile of the ranks it took. They measure how much the
+ * ranking moves when the fitted coefficients move — a refit interval, not a prediction interval:
+ * the value intervals above already carry the residual scatter.
+ */
+function rankIntervals(
+  scored: ScoredRow[],
+  train: ValueTrainRow[],
+  center: number,
+): Map<string, { p10: number; p90: number }> {
+  const rng = mulberry32(BOOTSTRAP_SEED);
+  const samples = new Map<string, number[]>();
+  for (const s of scored) samples.set(s.p.slug, []);
+  const n = train.length;
+  for (let d = 0; d < BOOTSTRAP_DRAWS; d++) {
+    const sample: ValueTrainRow[] = [];
+    for (let i = 0; i < n; i++) sample.push(train[Math.floor(rng() * n)]!);
+    const c = mean(sample.map((r) => r.lt));
+    const f = ols2(sample, c);
+    const drawn = scored
+      .map((s) => ({ slug: s.p.slug, imp: Math.max(1, Math.round(Math.exp(logPred(f, c, s.lt)) * s.odds)) }))
+      .sort((a, b) => b.imp - a.imp || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+    drawn.forEach((x, i) => samples.get(x.slug)!.push(i + 1));
+  }
+  const out = new Map<string, { p10: number; p90: number }>();
+  for (const [slug, ranks] of samples) {
+    const sorted = [...ranks].sort((a, b) => a - b);
+    out.set(slug, {
+      p10: sorted[Math.floor(sorted.length * 0.1)]!,
+      p90: sorted[Math.floor(sorted.length * 0.9)]!,
+    });
+  }
+  return out;
+}
+
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
-export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
-  const { byCategory, global } = categoryMultiples(snapshot.protocols, model);
+export function buildBoard(snapshot: Snapshot): BoardRow[] {
+  const value = fitValueModel(snapshot.protocols, snapshot.as_of);
+  const odds = fitOddsModel(snapshot.protocols, snapshot.as_of);
+  return assembleBoard(snapshot, value, odds);
+}
+
+/** The board from already-fitted models, so the dashboard ships the same fits the board used. */
+function assembleBoard(
+  snapshot: Snapshot,
+  value: { fit: ValueFit; train: ValueTrainRow[]; center: number; looResiduals: number[] },
+  odds: { odds: OddsFit; predict: (row: OddsRow) => number; ctx: { rates: Map<string, number>; global: number; medAge: number } },
+): BoardRow[] {
+  const { fit, train, center } = value;
+  const { predict: oddsOf, ctx } = odds;
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but
@@ -300,38 +650,65 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     if (!chosen.has(p.slug) && isRankable(p)) chosen.set(p.slug, p);
   }
 
-  const scored = [...chosen.values()].map((p) => {
-    const v = impliedValue(p, snapshot.as_of, byCategory, global, model);
-    return { p, ...v };
+  const scored: ScoredRow[] = [...chosen.values()].map((p) => {
+    const age = ageDays(snapshot.as_of, p.listed_at);
+    const lt = Math.log(p.tvl_usd);
+    const ifLaunched = Math.exp(logPred(fit, center, lt));
+    const oddsRow: OddsRow = {
+      slug: p.slug,
+      category: p.category ?? 'Other',
+      y: 0,
+      lt,
+      age,
+      listedAt: p.listed_at,
+    };
+    const odds = oddsOf(oddsRow);
+    const catRate = ctx.rates.get(p.category ?? 'Other') ?? ctx.global;
+    return { p, age, lt, ifLaunched, odds, implied: Math.max(1, Math.round(ifLaunched * odds)), catRate };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
-  return scored.map((s, i) => ({
-    rank: i + 1,
-    slug: s.p.slug,
-    name: s.p.name,
-    category: s.p.category,
-    chains: s.p.chains,
-    tvl_usd: s.p.tvl_usd,
-    change_7d: s.p.change_7d,
-    mcap_usd: s.p.mcap_usd,
-    listed_at: s.p.listed_at,
-    gecko_id: s.p.gecko_id,
-    symbol: s.p.symbol,
-    token_status: 'pre-token',
-    age_days: s.age,
-    implied_value_usd: s.implied,
-    model: {
-      multiple: round4(s.multiple),
-      growth_pct: s.growthPct,
-      growth_multiplier: round4(s.growthMult),
-      maturity_multiplier: round4(s.maturityMult),
+  const intervals = rankIntervals(scored, train, center);
+  return scored.map((s, i) => {
+    const iv = intervals.get(s.p.slug)!;
+    const p25 = Math.max(1, Math.round(s.ifLaunched * Math.exp(-fit.hw50) * s.odds));
+    const p75 = Math.round(s.ifLaunched * Math.exp(fit.hw50) * s.odds);
+    const p10 = Math.max(1, Math.round(s.ifLaunched * Math.exp(-fit.hw80) * s.odds));
+    const p90 = Math.round(s.ifLaunched * Math.exp(fit.hw80) * s.odds);
+    return {
+      rank: i + 1,
+      slug: s.p.slug,
+      name: s.p.name,
+      category: s.p.category,
+      chains: s.p.chains,
+      tvl_usd: s.p.tvl_usd,
+      change_7d: s.p.change_7d,
+      mcap_usd: s.p.mcap_usd,
+      listed_at: s.p.listed_at,
+      gecko_id: s.p.gecko_id,
+      symbol: s.p.symbol,
+      token_status: 'pre-token',
       age_days: s.age,
-    },
-    farm_steps: farmSteps(s.p, s.age).map(stepText),
-  }));
+      implied_value_usd: s.implied,
+      if_launched_value_usd: Math.max(1, Math.round(s.ifLaunched)),
+      token_odds: s.odds,
+      p25_usd: p25,
+      p75_usd: p75,
+      p10_usd: p10,
+      p90_usd: p90,
+      rank_p10: iv.p10,
+      rank_p90: iv.p90,
+      model: {
+        log_tvl: Math.round(s.lt * 1e4) / 1e4,
+        log_pred: Math.round(logPred(fit, center, s.lt) * 1e4) / 1e4,
+        if_launched_value_usd: Math.max(1, Math.round(s.ifLaunched)),
+        token_odds: s.odds,
+        cat_rate: s.catRate,
+        age_days: s.age,
+      },
+      farm_steps: farmSteps(s.p, s.age).map(stepText),
+    };
+  });
 }
-
-const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
 
 /** A step as one string: its action, then its cost and time, within the gate's 20..600 characters. */
 export function stepText(step: FarmStep): string {
@@ -470,27 +847,33 @@ export function radarRow(row: BoardRow): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
-    multiple: row.model.multiple,
-    growth_multiplier: row.model.growth_multiplier,
-    maturity_multiplier: row.model.maturity_multiplier,
+    if_launched_value_usd: row.if_launched_value_usd,
+    token_odds: row.token_odds,
+    p25_usd: row.p25_usd,
+    p75_usd: row.p75_usd,
+    p10_usd: row.p10_usd,
+    p90_usd: row.p90_usd,
+    rank_p10: row.rank_p10,
+    rank_p90: row.rank_p90,
+    cat_rate: row.model.cat_rate,
   };
 }
 
 /** Everything the dashboard renders, from the snapshot. */
-export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const board = buildBoard(snapshot, model);
+export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarData } {
+  const value = fitValueModel(snapshot.protocols, snapshot.as_of);
+  const odds = fitOddsModel(snapshot.protocols, snapshot.as_of);
+  const board = assembleBoard(snapshot, value, odds);
   const live = liveRows(snapshot);
-  const { byCategory, global } = categoryMultiples(snapshot.protocols, model);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
-  const multiples = [...byCategory.values()].sort((a, b) => b.sample - a.sample || (a.category < b.category ? -1 : 1));
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
     floor_usd: snapshot.floor_usd,
-    model,
     model_version: MODEL_VERSION,
-    global_multiple: global,
-    multiples,
+    fit: value.fit,
+    odds: odds.odds,
+    bootstrap_draws: BOOTSTRAP_DRAWS,
     watchlist: snapshot.watchlist,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,

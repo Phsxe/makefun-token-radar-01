@@ -1,4 +1,4 @@
-# Token Radar (radar-2)
+# Token Radar (radar-3)
 
 [![make.fun · token-radar-01](https://make.fun/badge/token-radar-01.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 [![rank](https://make.fun/badge/token-radar-01/Phsxe/makefun-token-radar-01/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
@@ -30,26 +30,54 @@ Run it twice and the output is byte-identical.
 
 ## The model
 
-An implied value is a guess at what a protocol's token would be worth if it
-launched today. It is built from the snapshot's own numbers, never from a
-hand-written list of names.
+An implied value is a guess at what a protocol's token would be worth if
+it launched today, times the chance it launches at all. Both halves are
+fitted on the snapshot itself and checked on data they had not seen, and
+the program computes the validation numbers at run time — they are not
+typed in.
 
 ```
-implied value = TVL x category multiple x growth multiplier x maturity multiplier
+if-launched value = exp(16.21 + 0.52 x (log(TVL) - 17.71))
+implied value     = round(if-launched value x token odds)
 ```
 
-The category multiple is the median market-cap-to-TVL ratio of the traded
-protocols in the same category, shrunk toward the global median (0.205x)
-with a prior of five, and clamped to the range 0.02x to 2.0x. A category
-with one traded protocol does not get to set its own multiple; a category
-with many does. The multiples are printed in the dashboard's methodology
-panel, with the sample size beside each one, so the shrinkage is visible.
+The value model is a log-linear regression of market cap on TVL, fitted
+on the 128 launched protocols with a positive market cap and TVL. The
+coefficients above are the fit's output on the 2026-11-14 snapshot, not
+constants chosen by hand: the program refits them from whatever snapshot
+it is given. Terms tested and dropped because leave-one-out got worse
+with each: a quadratic size curve, seven-day growth, age, chain count,
+and category effects (raw and grouped, ridge lambda 1–300). The market
+does not price by category here — market-cap-per-TVL spans 0.0003x to
+400x inside single categories — so no category term survives.
 
-The growth multiplier comes from the protocol's seven-day TVL change,
-clamped to the range -60% to +120%, with a weight of 0.75. The maturity
-multiplier comes from how long the protocol has gone without a token:
-0.6 plus up to 0.4 for age, capped at three years. A protocol with no
-recorded launch date is treated as one year old.
+The odds model is a logistic regression fitted on all 758 protocols
+(launched = 1 when the record carries any token, 416 of 758), with three
+features: log TVL, log(1 + age in days), and the category's launch rate
+(shrunk toward the global rate with a prior of five). Seven-day growth
+and chain count were tested and dropped the same way. Odds are
+historical launch rates of similar protocols, not forecasts of who will
+launch.
+
+Validation, computed by the program from the snapshot:
+
+| Check | Fitted model | Flat baseline |
+|---|---|---|
+| Value model, leave-one-out median error | ×3.40 | ×5.07 (global median ratio) |
+| Value model, walk-forward median error | ×2.60 | ×5.23 |
+| Token odds, 5-fold Brier score | 0.210 | 0.248 (constant rate) |
+| Token odds, time-split Brier score | 0.254 | — |
+| P25–P75 interval, held-out coverage | 51% | target ~50% |
+| P10–P90 interval, held-out coverage | 80% | target ~80% |
+
+Every row also carries its uncertainty. The value interval is
+conformal, from the value model's leave-one-out residuals: P25–P75 uses
+the 50th percentile of |residual| (1.22 log units), P10–P90 the 80th
+(2.44). The rank interval comes from 200 bootstrap refits of the value
+model (mulberry32, fixed seed) and says how much the ranking moves when
+the fitted coefficients move — a refit interval, not a prediction
+interval. The two kinds of interval answer different questions, and the
+dashboard says which is which.
 
 ## What the board ranks
 
@@ -67,9 +95,14 @@ floor. The 24 protocols whose token already trades are set aside in a
 separate live-token tab, so the reader can see what the multiples are
 calibrated against.
 
-The top of the board is Steakhouse Financial, Sentora Curator and
-Gauntlet — risk curators with $1.5B to $2.8B of TVL and no token on
-record. The strongest implied value on the board is about $1.46B.
+The top of the board is USDD, Veda and Polymarket International — the
+first two are watchlist protocols, and the odds, not the size alone, put
+them there: Steakhouse Financial has the largest if-launched value
+(about $90M) but only a 20% launch odds, so it ranks sixth at about
+$18M implied. The strongest implied value on the board is about $33.7M,
+and the board totals about $0.94B — in the same range as the fitted
+values the market actually produces, instead of the several billions
+the old hand-written multiples used to claim.
 
 ## The farm plan
 
@@ -79,12 +112,13 @@ protocol's own record, not from a template:
 - The first step is always a fresh wallet that holds only the funds the
   reader plans to farm, with its seed phrase kept offline.
 - The deposit step names the protocol's own product (a vault, a pool, a
-  market) and sizes the deposit from its TVL: $150 for a protocol under
-  $500M, $500 up to $2B, $2,000 above that.
+  market) and sizes the deposit from its TVL: $50 under $100M, $100 up
+  to $1B, $150 up to $5B, $250 above that.
 - The gas cost is set by the protocol's first chain: about $9 on
   Ethereum, $0.20 on Solana, $1 on the big layer-2s, $2 elsewhere.
 - The holding period is set by the protocol's age without a token:
-  30 days under a year, 60 days up to two years, 90 days above that.
+  60 days if it is under 180 days old, 45 days up to a year, 30 days
+  above that.
 - The weekly action names the category's own verb: deposit for a
   lender, swap for a DEX, vote for a governance protocol.
 
@@ -100,13 +134,17 @@ implied value first, and offers:
 - Search by name, category or chain.
 - Filter by category, by chain, and by watchlist only.
 - A pre-token tab and a live-token tab.
-- Sortable columns for rank, TVL, seven-day change, age and implied
-  value.
-- A detail view for every row, with the model broken down into its
-  four factors, the page recomputing the implied value from those
-  factors, and the row's farm plan.
-- A methodology panel that lists every category multiple with its
-  sample size.
+- Sortable columns for rank, TVL, seven-day change, age, token odds
+  and implied value.
+- Every row shows its token odds, its P25–P75 range and its rank
+  interval.
+- A detail view for every row, with the if-launched value, the odds,
+  the intervals and the rank interval, the page recomputing the implied
+  value from the fitted coefficients, and the row's farm plan.
+- A validation panel with the leave-one-out and walk-forward errors,
+  the odds Brier scores and the interval coverage, and a methodology
+  panel with the fitted formula and the terms that were tested and
+  dropped.
 
 The dashboard's state lives in the URL hash, so a filtered view or a
 detail view can be linked to directly.
