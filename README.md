@@ -1,4 +1,4 @@
-# Token Radar (radar-3)
+# Token Radar (radar-5)
 
 [![make.fun · token-radar-01](https://make.fun/badge/token-radar-01.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 [![rank](https://make.fun/badge/token-radar-01/Phsxe/makefun-token-radar-01/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
@@ -37,19 +37,26 @@ the program computes the validation numbers at run time — they are not
 typed in.
 
 ```
-if-launched value = exp(16.21 + 0.52 x (log(TVL) - 17.71))
+if-launched value = exp(15.96 + 0.39 x (log(TVL) - 17.39))
 implied value     = round(if-launched value x token odds)
 ```
 
 The value model is a log-linear regression of market cap on TVL, fitted
-on the 128 launched protocols with a positive market cap and TVL. The
-coefficients above are the fit's output on the 2026-11-14 snapshot, not
-constants chosen by hand: the program refits them from whatever snapshot
-it is given. Terms tested and dropped because leave-one-out got worse
-with each: a quadratic size curve, seven-day growth, age, chain count,
-and category effects (raw and grouped, ridge lambda 1–300). The market
-does not price by category here — market-cap-per-TVL spans 0.0003x to
-400x inside single categories — so no category term survives.
+on the 92 launched protocols the board treats as comparable — the same
+exclusions the board applies to ranking (exchanges, bridges, liquid
+staking, versioned pools, wrapped or staked products), applied to the
+launched set, so the model does not learn its multiples from protocols
+the board itself refuses to rank. The coefficients above are the fit's
+output on the 2026-11-14 snapshot, not constants chosen by hand: the
+program refits them from whatever snapshot it is given. Terms tested
+and dropped because leave-one-out and walk-forward did not both
+improve: a quadratic size curve, seven-day growth, age, chain count,
+their combinations, TVL per chain, a size-by-age interaction, and
+category effects (intercepts, slopes, and ridge lambda 1–1024). A
+placebo — another protocol's growth rate — was tested the same way and
+also failed both checks, so the tests have teeth. The market does not
+price by category here — market-cap-per-TVL spans 0.0003x to 400x
+inside single categories — so no category term survives.
 
 The odds model is a logistic regression fitted on all 758 protocols
 (launched = 1 when the record carries any token, 416 of 758), with three
@@ -63,8 +70,8 @@ Validation, computed by the program from the snapshot:
 
 | Check | Fitted model | Flat baseline |
 |---|---|---|
-| Value model, leave-one-out median error | ×3.40 | ×5.07 (global median ratio) |
-| Value model, walk-forward median error | ×2.60 | ×5.23 |
+| Value model, leave-one-out median error | ×3.27 | ×4.65 (global median ratio) |
+| Value model, walk-forward median error | ×2.20 | ×4.35 |
 | Token odds, 5-fold Brier score | 0.210 | 0.248 (constant rate) |
 | Token odds, time-split Brier score | 0.254 | — |
 | P25–P75 interval, held-out coverage | 51% | target ~50% |
@@ -72,8 +79,8 @@ Validation, computed by the program from the snapshot:
 
 Every row also carries its uncertainty. The value interval is
 conformal, from the value model's leave-one-out residuals: P25–P75 uses
-the 50th percentile of |residual| (1.22 log units), P10–P90 the 80th
-(2.44). The rank interval comes from 200 bootstrap refits of the value
+the 50th percentile of |residual| (1.21 log units), P10–P90 the 80th
+(2.33). The rank interval comes from 200 bootstrap refits of the value
 model (mulberry32, fixed seed) and says how much the ranking moves when
 the fitted coefficients move — a refit interval, not a prediction
 interval. The two kinds of interval answer different questions, and the
@@ -97,12 +104,14 @@ calibrated against.
 
 The top of the board is USDD, Veda and Polymarket International — the
 first two are watchlist protocols, and the odds, not the size alone, put
-them there: Steakhouse Financial has the largest if-launched value
-(about $90M) but only a 20% launch odds, so it ranks sixth at about
-$18M implied. The strongest implied value on the board is about $33.7M,
-and the board totals about $0.94B — in the same range as the fitted
-values the market actually produces, instead of the several billions
-the old hand-written multiples used to claim.
+them there: Sentora Curator has the largest if-launched value
+(about $48M) but only a 17% launch odds, so it ranks twenty-second at
+about $8.3M implied, and Steakhouse Financial, the next-largest
+if-launched value at about $48M, ranks seventeenth at about $9.6M
+implied on 20% odds. The strongest implied value on the board is about
+$20.1M, and the board totals about $0.78B — in the same range as the
+fitted values the market actually produces, instead of the several
+billions the old hand-written multiples used to claim.
 
 ## The farm plan
 
