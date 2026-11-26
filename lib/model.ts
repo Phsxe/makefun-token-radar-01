@@ -85,6 +85,15 @@ export const BOOTSTRAP_DRAWS = 200;
 /** The fixed seed for the rank-interval bootstrap: the same seed, the same ranks, every run. */
 export const BOOTSTRAP_SEED = 0xc0ffee;
 
+/** The farm verdict's economics, all stated as assumptions on the board, never hidden. */
+export const AIRDROP_SHARE_DEFAULT = 0.07;
+export const VERDICT_DEPOSIT_DEFAULT = 2500;
+export const DEPOSIT_TIERS = [250, 500, 1000, 2500, 5000, 10000];
+export const AIRDROP_SHARES = [0.03, 0.05, 0.07, 0.1, 0.15];
+export const FARM_PER_HOUR = 25;
+export const BRIDGE_FEE_USD = 5;
+export const TBILL_RATE = 0.045;
+
 /** The fitted value model and the validation the program computed for it. */
 export interface ValueFit {
   n_train: number;
@@ -126,6 +135,18 @@ export interface FarmStep {
   time: string;
 }
 
+/** A farm verdict: the economics of farming one row at a chosen deposit and airdrop share. */
+export interface FarmVerdict {
+  deposit_usd: number;
+  airdrop_share: number;
+  expected_airdrop_usd: number;
+  fees_usd: number;
+  net_return_usd: number;
+  hours: number;
+  net_per_hour_usd: number;
+  verdict: 'FARM' | 'MARGINAL' | 'SKIP';
+}
+
 /** One row of board.json: the ranked board's row. */
 export interface BoardRow {
   rank: number;
@@ -159,6 +180,8 @@ export interface BoardRow {
     age_days: number | null;
   };
   farm_steps: string[];
+  /** The farm verdict at the default deposit ($2,500) and airdrop share (7%). */
+  farm: FarmVerdict;
 }
 
 /** The dashboard's compact view of one row, with farm plans generated in the page. */
@@ -183,6 +206,8 @@ export interface RadarRow {
   rank_p10: number;
   rank_p90: number;
   cat_rate: number;
+  /** The farm verdict at the default deposit ($2,500) and airdrop share (7%). */
+  farm: FarmVerdict;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -194,6 +219,25 @@ export interface LiveRow {
   tvl_usd: number;
   mcap_usd: number | null;
   change_7d: number | null;
+}
+
+/** One protocol-accounting group: mutually exclusive, and all groups sum to the snapshot size. */
+export interface AccountingGroup {
+  key: string;
+  label: string;
+  count: number;
+}
+
+/** A launched protocol the detail page can show as a peer, with its leave-one-out model ratio. */
+export interface PeerRow {
+  slug: string;
+  name: string;
+  category: string;
+  listed_at: string | null;
+  mcap_usd: number;
+  tvl_usd: number;
+  /** The value model's leave-one-out prediction divided by the actual market cap. */
+  loo_ratio: number;
 }
 
 /** Everything the dashboard needs: the board, the live set, the fits and their validation. */
@@ -212,6 +256,13 @@ export interface RadarData {
   live_size: number;
   rows: RadarRow[];
   live: LiveRow[];
+  /** The 758 protocols split into mutually exclusive groups that sum to 758. */
+  accounting: AccountingGroup[];
+  /** Validation checks the fitted models passed, out of the checks run (see buildRadar). */
+  validation_passed: number;
+  validation_total: number;
+  /** The launched protocols with a usable market cap, for the detail page's peer table. */
+  peers: PeerRow[];
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -306,7 +357,7 @@ function logPred(fit: { intercept: number; slope: number }, center: number, lt: 
  * alongside it: leave-one-out and walk-forward error multiples, the flat baselines for comparison,
  * and the conformal half-widths from the leave-one-out residuals.
  */
-function fitValueModel(protocols: SnapshotProtocol[], asOf: string): { fit: ValueFit; train: ValueTrainRow[]; center: number; looResiduals: number[] } {
+function fitValueModel(protocols: SnapshotProtocol[], asOf: string): { fit: ValueFit; train: ValueTrainRow[]; center: number; looResiduals: number[]; looPred: Map<string, number> } {
   const train: ValueTrainRow[] = protocols
     .filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0)
     .map((p) => ({ lt: Math.log(p.tvl_usd), y: Math.log(p.mcap_usd!), listedAt: p.listed_at, slug: p.slug }));
@@ -314,14 +365,16 @@ function fitValueModel(protocols: SnapshotProtocol[], asOf: string): { fit: Valu
   const full = ols2(train, center);
 
   // Leave-one-out: refit on all but one, predict the held-out one. Also keeps the log residuals
-  // the conformal intervals are built from.
+  // the conformal intervals are built from, and the held-out predictions the peer table quotes.
   const looErrors: number[] = [];
   const looResiduals: number[] = [];
+  const looPred = new Map<string, number>();
   for (let i = 0; i < train.length; i++) {
     const rest = train.filter((_, j) => j !== i);
     const c = mean(rest.map((r) => r.lt));
     const f = ols2(rest, c);
     const pred = Math.exp(logPred(f, c, train[i]!.lt));
+    looPred.set(train[i]!.slug, pred);
     looErrors.push(errorMultiple(pred, Math.exp(train[i]!.y)));
     looResiduals.push(train[i]!.y - logPred(f, c, train[i]!.lt));
   }
@@ -386,7 +439,7 @@ function fitValueModel(protocols: SnapshotProtocol[], asOf: string): { fit: Valu
     coverage50,
     coverage80,
   };
-  return { fit, train, center, looResiduals };
+  return { fit, train, center, looResiduals, looPred };
 }
 
 /** One protocol, as the odds model trains and scores it. */
@@ -706,6 +759,7 @@ function assembleBoard(
         age_days: s.age,
       },
       farm_steps: farmSteps(s.p, s.age).map(stepText),
+      farm: farmVerdict(s.p, s.age, s.implied, VERDICT_DEPOSIT_DEFAULT, AIRDROP_SHARE_DEFAULT),
     };
   });
 }
@@ -747,6 +801,49 @@ function holdDaysFor(age: number | null): number {
   if (age < 180) return 60;
   if (age < 365) return 45;
   return 30;
+}
+
+/** The active hours a farm takes at a given hold: setup, one weekly action, claim and the log. */
+function farmHours(holdDays: number): number {
+  const minutes = 5 + 15 + 10 * Math.ceil(holdDays / 7) + 10 + 5;
+  return Math.round((minutes / 60) * 100) / 100;
+}
+
+/**
+ * One row's farm verdict at a chosen deposit and airdrop share. The economics are stated
+ * assumptions, never hidden: the airdrop pool is the airdrop share of the implied value, split
+ * pro-rata by capital, so your share is your deposit's share of the protocol's TVL; the fees are
+ * the chain's gas times the six farm steps plus one $5 bridge; the hours are the farm plan's
+ * active time at the hold (or at `termDays` when the board overrides it). FARM means the farm
+ * pays at least $25 an hour after fees; MARGINAL means it pays but slower; SKIP means it loses
+ * money at this deposit and share — raise either and the verdict moves, which is the point of
+ * the board's sliders.
+ */
+export function farmVerdict(
+  p: SnapshotProtocol,
+  age: number | null,
+  impliedValueUsd: number,
+  depositUsd: number,
+  airdropShare: number,
+  termDays: number | null = null,
+): FarmVerdict {
+  const depositShare = Math.min(1, depositUsd / Math.max(1, p.tvl_usd));
+  const expectedAirdrop = impliedValueUsd * airdropShare * depositShare;
+  const fees = gasUsd(chainOf(p)) * 6 + BRIDGE_FEE_USD;
+  const hours = farmHours(termDays ?? holdDaysFor(age));
+  const net = expectedAirdrop - fees;
+  const perHour = net / hours;
+  const verdict: FarmVerdict['verdict'] = net > 0 && perHour >= FARM_PER_HOUR ? 'FARM' : net > 0 ? 'MARGINAL' : 'SKIP';
+  return {
+    deposit_usd: depositUsd,
+    airdrop_share: airdropShare,
+    expected_airdrop_usd: Math.round(expectedAirdrop * 100) / 100,
+    fees_usd: Math.round(fees * 100) / 100,
+    net_return_usd: Math.round(net * 100) / 100,
+    hours,
+    net_per_hour_usd: Math.round(perHour * 100) / 100,
+    verdict,
+  };
 }
 
 /** The category's one action, in the words a farmer can follow. */
@@ -856,7 +953,45 @@ export function radarRow(row: BoardRow): RadarRow {
     rank_p10: row.rank_p10,
     rank_p90: row.rank_p90,
     cat_rate: row.model.cat_rate,
+    farm: row.farm,
   };
+}
+
+/** The snapshot's protocols split into mutually exclusive groups that sum to the snapshot size.
+ * The split reuses the board's own rules — the board's slugs, the watchlist, isPreToken and the
+ * exclusion categories — so the ledger can never disagree with the board: one function, one
+ * source of numbers. First match wins, so a protocol lands in exactly one group. */
+export function protocolAccounting(snapshot: Snapshot, boardSlugs: Set<string>): AccountingGroup[] {
+  const wl = new Set(snapshot.watchlist);
+  const counts = new Map<string, number>();
+  const bump = (key: string): void => counts.set(key, (counts.get(key) ?? 0) + 1);
+  for (const p of snapshot.protocols) {
+    if (boardSlugs.has(p.slug)) {
+      bump(wl.has(p.slug) ? 'ranked_watchlist' : 'ranked_early');
+    } else if (!isPreToken(p)) {
+      bump(p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0 ? 'launched_usable' : 'launched_no_mcap');
+    } else if (p.category === 'Bridge' || p.category === 'Canonical Bridge') {
+      bump('bridge');
+    } else if (p.category === 'Liquid Staking' || p.category === 'Liquid Restaking' || p.category === 'Restaked BTC') {
+      bump('liquid_staking');
+    } else if (p.category === 'CEX' || EXCHANGE_PREFIX.test(p.name)) {
+      bump('exchange');
+    } else {
+      // The only exclusions left are a versioned name or a wrapped/staked word in the name.
+      bump('versioned');
+    }
+  }
+  const labels: Record<string, string> = {
+    ranked_watchlist: 'Ranked, watchlist',
+    ranked_early: 'Ranked, early radar',
+    launched_usable: 'Launched, usable market cap',
+    launched_no_mcap: 'Launched, no usable market cap',
+    bridge: 'Bridges (not ranked)',
+    liquid_staking: 'Liquid staking (not ranked)',
+    exchange: 'Exchanges (not ranked)',
+    versioned: 'Versioned or wrapped pools (not ranked)',
+  };
+  return Object.keys(labels).map((key) => ({ key, label: labels[key]!, count: counts.get(key) ?? 0 }));
 }
 
 /** Everything the dashboard renders, from the snapshot. */
@@ -866,6 +1001,38 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
   const board = assembleBoard(snapshot, value, odds);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  const accounting = protocolAccounting(snapshot, new Set(board.map((r) => r.slug)));
+  const accounted = accounting.reduce((a, g) => a + g.count, 0);
+  if (accounted !== snapshot.protocols.length) {
+    throw new SnapshotError(`protocol accounting sums to ${accounted}, not ${snapshot.protocols.length}`);
+  }
+  // The five validation checks the fitted models had to pass: both error multiples beat their
+  // flat baselines, the odds Brier beats its baseline, and both interval coverages land near
+  // their targets. They are computed from the fits, not typed in.
+  const f = value.fit;
+  const o = odds.odds;
+  const checks = [
+    f.loo_median < f.flat_loo,
+    f.walk_forward_median < f.flat_walk_forward,
+    o.brier_cv < o.brier_baseline,
+    f.coverage50 >= 0.4 && f.coverage50 <= 0.6,
+    f.coverage80 >= 0.7 && f.coverage80 <= 0.9,
+  ];
+  const index = bySlug(snapshot.protocols);
+  const peers: PeerRow[] = [...value.looPred.entries()]
+    .map(([slug, pred]) => {
+      const p = index.get(slug)!;
+      return {
+        slug,
+        name: p.name,
+        category: p.category ?? 'Other',
+        listed_at: p.listed_at,
+        mcap_usd: p.mcap_usd!,
+        tvl_usd: p.tvl_usd,
+        loo_ratio: Math.round((pred / p.mcap_usd!) * 100) / 100,
+      };
+    })
+    .sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -881,6 +1048,10 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     live_size: live.length,
     rows: board.map(radarRow),
     live,
+    accounting,
+    validation_passed: checks.filter(Boolean).length,
+    validation_total: checks.length,
+    peers,
   };
   return { board, radar };
 }
