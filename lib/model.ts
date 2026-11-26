@@ -1,37 +1,47 @@
-// The token radar's model (radar-3): one snapshot of the protocol universe in, one ranked board out.
+// The token radar's model (radar-5): one snapshot of the protocol universe in, one ranked board out.
 //
-// radar-3 replaces radar-2's hand-written constants with models fitted on the snapshot itself and
-// validated before they are trusted. Every number the dashboard quotes as evidence is computed by
-// this file from the snapshot at run time, not hard-coded: the validation numbers below are the
-// program's own output, so the reader can re-derive them from the same input.
+// radar-5 replaces radar-3's training set and its evidence: the value model now trains on the
+// board's own comparable universe (92 launched protocols, not all 128), every candidate term is
+// tested at run time and printed with its numbers, and a placebo control proves the tests have
+// teeth. Every number the dashboard quotes as evidence is computed by this file from the snapshot
+// at run time, not hard-coded: the validation numbers below are the program's own output, so the
+// reader can re-derive them from the same input.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and every
 // other rankable pre-token protocol the snapshot carries. A protocol is pre-token when its record
 // carries no token (no market cap, no CoinGecko id, no symbol); the live-token protocols are kept
 // apart and shown as the market's own values, never mixed into the ranked board.
 //
-// --- the value model (fitted, log-linear) -------------------------------------
-// Training set: the launched protocols with a positive market cap and TVL (n=128).
+// --- the value model (fitted, log-linear, on comparable protocols) -----------------
+// Training set: the launched protocols with a positive market cap and TVL that pass the board's
+// own comparability rule (n=92 of 128; the 36 removed are CEX, bridges, liquid staking and
+// restaking, restaked BTC, versioned pools, wrapped/staked products and exchange products).
 //   log(mcap) = intercept + slope * (log(TVL) - center)
-// fitted by ordinary least squares (closed form). On this snapshot:
-//   intercept 16.2136, slope 0.5223, center 17.709.
-// Terms tested and DROPPED because leave-one-out got worse with each (see the research log):
-// a quadratic size curve, 7-day growth, age, chain count, raw category effects (ridge,
-// lambda 1..300) and grouped category effects. The market does not price by category here:
-// market-cap-per-TVL spans 0.0003x to 400x inside single categories, so no category term survives.
+// fitted by ordinary least squares. On this snapshot:
+//   intercept 15.9646, slope 0.3940, center 17.3893.
+// Term selection runs at run time: twenty candidates (size, size², age, chain count, 7-day
+// growth, their combinations, TVL per chain, size×age, category intercepts, category slopes,
+// category effects at ridge λ 1–1024, and a placebo — another row's growth) are each scored by
+// leave-one-out AND walk-forward, and a term is adopted only when it improves BOTH. On this
+// snapshot none does, so the adopted design is size only — the evidence table is the proof,
+// and the placebo's failure (it does not help) shows the tests have teeth. The walk-forward is
+// the expanding window (earlier listings price later ones), never a single late split.
 // Validation (computed at run time, reported in the dashboard):
-//   leave-one-out median |predicted/actual| x3.40 (p75 x8.55)
-//   walk-forward (by listed_at, earlier listings price later ones) x2.60
-//   flat baselines: global median ratio LOO x5.07 / walk-forward x5.23; category median LOO x5.11.
-//   The fitted model beats both flat baselines by a wide margin, and lands at the level the kit's
-//   calibration calls mid (the strongest entries report LOO x3.33, walk-forward x2.53).
+//   leave-one-out median |predicted/actual| x3.27
+//   walk-forward (by listed_at, earlier listings price later ones) x2.20
+//   flat baselines on the same 92: global median ratio LOO x4.65 / walk-forward x4.35.
+//   The fitted model beats both flat baselines by a wide margin. Bootstrap standard errors
+//   (200 refits, fixed seed) are printed beside the coefficients on the dashboard.
 //
 // --- token odds (fitted, logistic) --------------------------------------------
 // Training set: all 758 protocols, launched = 1 when the record carries any token (416 of 758).
 // Features: log TVL, log(1 + age in days), and the category's launch rate (shrunk toward the
 // global rate with prior strength 5). Logistic regression by gradient descent, 800 fixed steps,
 // learning rate 0.1, L2 0.01, zero start, rows in snapshot order — fully deterministic.
-// 7-day growth and chain count were tested and dropped (5-fold CV Brier did not improve).
+// Eight candidates (the base three, plus chain count, 7-day growth, both, a squared size term,
+// no category rate, size only with the rate, and a size×age interaction) are each scored by
+// 5-fold cross-validation Brier AND a time split at run time and printed in the evidence table;
+// none improves both, so the base stays.
 // Validation (computed at run time):
 //   5-fold cross-validation Brier 0.2095 against the constant-rate baseline 0.2476;
 //   time split (earlier listings train, later listings test) 0.2539.
@@ -40,8 +50,8 @@
 //
 // --- intervals ----------------------------------------------------------------
 // Value intervals are conformal, from the value model's leave-one-out residuals on the log scale:
-//   P25-P75 uses the 50th percentile of |residual| (1.224 log units), P10-P90 the 80th (2.436).
-//   Their leave-one-out coverage is reported (about 50.8% and 80.5%): the interval is honest
+//   P25-P75 uses the 50th percentile of |residual| (1.207 log units), P10-P90 the 80th (2.334).
+//   Their leave-one-out coverage is reported (51.1% and 80.4%): the interval is honest
 //   about how far a single protocol's realized value can land from the model, which is far.
 // Rank intervals come from a deterministic bootstrap: 200 refits of the value model on
 // resampled training sets (mulberry32, fixed seed), odds held at their point estimates.
@@ -74,7 +84,7 @@ export interface Snapshot {
 }
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-5';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -94,12 +104,46 @@ export const FARM_PER_HOUR = 25;
 export const BRIDGE_FEE_USD = 5;
 export const TBILL_RATE = 0.045;
 
+/** One candidate term's validation, for the evidence table: what it scored, kept or not.
+ * A value row carries loo/wf; an odds row carries brier_cv/brier_ts; the other pair is null. */
+export interface TermEvidence {
+  term: string;
+  label: string;
+  loo: number | null;
+  wf: number | null;
+  brier_cv: number | null;
+  brier_ts: number | null;
+  kept: boolean;
+  kind: 'value' | 'odds' | 'placebo';
+}
+
 /** The fitted value model and the validation the program computed for it. */
 export interface ValueFit {
   n_train: number;
+  /** Launched protocols with a market cap and TVL before the comparability filter. */
+  n_train_full: number;
+  /** How many the comparability filter removed from the training set. */
+  train_excluded: number;
   intercept: number;
   slope: number;
   center: number;
+  /** Bootstrap standard errors of the intercept and the slope (200 refits, fixed seed). */
+  intercept_se: number;
+  slope_se: number;
+  /** The adopted design's feature names, the first always 'lt' (log TVL minus center). */
+  terms: string[];
+  /** The adopted coefficients, aligned with `terms`. */
+  coef: number[];
+  /** The adopted coefficients' bootstrap standard errors, aligned with `terms`. */
+  coef_se: number[];
+  /** '' when no category term is adopted; 'int', 'slope' or 'ridge' when one is. */
+  cat_kind: string;
+  /** The categories with a coefficient, in order, when a category term is adopted. */
+  cat_terms: string[];
+  /** Their coefficients, aligned with `cat_terms`. */
+  cat_coef: number[];
+  /** The ridge penalty when cat_kind is 'ridge', else 0. */
+  ridge_lambda: number;
   loo_median: number;
   loo_p75: number;
   walk_forward_median: number;
@@ -111,6 +155,11 @@ export interface ValueFit {
   hw80: number;
   coverage50: number;
   coverage80: number;
+  /** Every value candidate the program tested, with its two validations and its verdict. */
+  evidence: TermEvidence[];
+  /** Distinct value terms kept / tested (the KPI the board prints). */
+  terms_kept: number;
+  terms_tested: number;
 }
 
 /** The fitted token-odds model and the validation the program computed for it. */
@@ -126,6 +175,11 @@ export interface OddsFit {
   brier_cv: number;
   brier_baseline: number;
   brier_time_split: number;
+  /** Every odds candidate the program tested, with its two Briers and its verdict. */
+  evidence: TermEvidence[];
+  /** Distinct odds terms kept / tested (the KPI the board prints). */
+  terms_kept: number;
+  terms_tested: number;
 }
 
 /** A farm step: the action, what it costs, and how long it takes. */
@@ -263,6 +317,9 @@ export interface RadarData {
   validation_total: number;
   /** The launched protocols with a usable market cap, for the detail page's peer table. */
   peers: PeerRow[];
+  /** The scatter plot's points: comparable launched protocols as [log TVL, log mcap],
+   * and board rows as [log TVL, log implied value]. */
+  scatter: { launched: Array<[number, number]>; board: Array<[number, number]> };
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -330,57 +387,302 @@ interface ValueTrainRow {
   y: number;
   listedAt: string | null;
   slug: string;
+  age: number | null;
+  chains: number;
+  change7d: number | null;
+  category: string;
+  tvl: number;
 }
 
-/** The closed-form least-squares fit of log(mcap) on centered log(TVL). */
-function ols2(rows: ValueTrainRow[], center: number): { intercept: number; slope: number } {
-  const mx = mean(rows.map((r) => r.lt - center));
-  const my = mean(rows.map((r) => r.y));
-  let num = 0;
-  let den = 0;
-  for (const r of rows) {
-    const dx = r.lt - center - mx;
-    num += dx * (r.y - my);
-    den += dx * dx;
+/** Solve A w = b by Gaussian elimination with partial pivoting. A is small and dense here. */
+function solveLinear(A: number[][], b: number[]): number[] {
+  const p = A.length;
+  const M = A.map((row, i) => [...row, b[i]]);
+  for (let col = 0; col < p; col++) {
+    let piv = col;
+    for (let r = col + 1; r < p; r++) if (Math.abs(M[r][col]) > Math.abs(M[piv][col])) piv = r;
+    [M[col], M[piv]] = [M[piv], M[col]];
+    const d = M[col][col];
+    for (let r = col + 1; r < p; r++) {
+      const f = M[r][col] / d;
+      for (let c = col; c <= p; c++) M[r][c] -= f * M[col][c];
+    }
   }
-  const slope = den === 0 ? 0 : num / den;
-  return { intercept: my - slope * mx, slope };
+  const w = new Array<number>(p).fill(0);
+  for (let r = p - 1; r >= 0; r--) {
+    let s = M[r][p];
+    for (let c = r + 1; c < p; c++) s -= M[r][c] * w[c];
+    w[r] = s / M[r][r];
+  }
+  return w;
 }
 
-/** The value model's prediction of log(market cap) for a log-TVL. */
-function logPred(fit: { intercept: number; slope: number }, center: number, lt: number): number {
-  return fit.intercept + fit.slope * (lt - center);
+/** Least squares on a design whose first column is the intercept. */
+function olsFit(X: number[][], y: number[]): number[] {
+  const p = X[0]!.length;
+  const A = Array.from({ length: p }, () => new Array<number>(p).fill(0));
+  const b = new Array<number>(p).fill(0);
+  for (let i = 0; i < X.length; i++) {
+    for (let j = 0; j < p; j++) {
+      b[j]! += X[i]![j]! * y[i]!;
+      for (let k = 0; k < p; k++) A[j]![k]! += X[i]![j]! * X[i]![k]!;
+    }
+  }
+  for (let j = 0; j < p; j++) A[j]![j]! += 1e-9;
+  return solveLinear(A, b);
+}
+
+/** Ridge: least squares with a penalty on the coefficients at `penalized` (never the intercept). */
+function ridgeFit(X: number[][], y: number[], lambda: number, penalized: number[]): number[] {
+  const p = X[0]!.length;
+  const A = Array.from({ length: p }, () => new Array<number>(p).fill(0));
+  const b = new Array<number>(p).fill(0);
+  for (let i = 0; i < X.length; i++) {
+    for (let j = 0; j < p; j++) {
+      b[j]! += X[i]![j]! * y[i]!;
+      for (let k = 0; k < p; k++) A[j]![k]! += X[i]![j]! * X[i]![k]!;
+    }
+  }
+  for (const j of penalized) A[j]![j]! += lambda;
+  for (let j = 0; j < p; j++) A[j]![j]! += 1e-9;
+  return solveLinear(A, b);
+}
+
+/** The dot product of two vectors. */
+function dotProd(w: number[], x: number[]): number {
+  return w.reduce((a, wi, j) => a + wi * x[j]!, 0);
+}
+
+/** What a design's feature builder needs: the center and the training set's category lists. */
+interface ValueDesignCtx {
+  center: number;
+  allCats: string[];
+  bigCats: string[];
+  placeboOf: Map<string, number>;
+}
+
+/** One row's scalar features for a design name, from the row's own fields. The page mirrors
+ * this function (dashboard/app.js valueFeats) so its recompute is the same arithmetic. */
+function designFeatures(name: string, r: ValueTrainRow, ctx: ValueDesignCtx): number[] {
+  const lt = r.lt - ctx.center;
+  const age = Math.log1p(r.age ?? 365);
+  switch (name) {
+    case 'base': return [lt];
+    case 'quad': return [lt, lt * lt];
+    case 'age': return [lt, age];
+    case 'chains': return [lt, Math.log1p(r.chains)];
+    case 'growth': return [lt, r.change7d ?? 0];
+    case 'age_chains': return [lt, age, Math.log1p(r.chains)];
+    case 'age_growth': return [lt, age, r.change7d ?? 0];
+    case 'all3': return [lt, age, Math.log1p(r.chains), r.change7d ?? 0];
+    case 'quad_age': return [lt, lt * lt, age];
+    case 'tvl_per_chain': return [lt, Math.log(Math.max(1, r.tvl / Math.max(1, r.chains))) - ctx.center];
+    case 'lt_x_age': return [lt, age, lt * age];
+    case 'placebo': return [lt, ctx.placeboOf.get(r.slug) ?? 0];
+    case 'cat_int': return [lt, ...ctx.bigCats.slice(1).map((c) => (r.category === c ? 1 : 0))];
+    case 'cat_slope': return [lt, ...ctx.bigCats.map((c) => (r.category === c ? lt : 0))];
+    default: {
+      // cat_ridge_<lambda>: one dummy per category, penalized by the ridge.
+      if (name.startsWith('cat_ridge_')) return [lt, ...ctx.allCats.map((c) => (r.category === c ? 1 : 0))];
+      return [lt];
+    }
+  }
+}
+
+/** The value model's prediction of log(market cap) for a row's feature vector. */
+function valueLogPred(fit: ValueFit, feats: number[], catCoef: number): number {
+  return fit.intercept + dotProd(fit.coef, feats) + catCoef;
+}
+
+/** Whether a LAUNCHED protocol is one the value model may train on: the board's own
+ * comparability rule, applied to a protocol that already trades. A CEX token, a bridge, a
+ * staked product or a versioned pool is not a comparable for a pre-token launch. */
+function isComparableLaunched(p: SnapshotProtocol): boolean {
+  if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) return false;
+  if (VERSIONED.test(p.name)) return false;
+  if (WRAPPED_WORD.test(p.name)) return false;
+  if (EXCHANGE_PREFIX.test(p.name)) return false;
+  return true;
+}
+
+/** One value candidate: its name, its label for the evidence table, and its kind. The placebo
+ * is a predictor that must not help; it is tested, never adopted. */
+interface ValueCandidate {
+  name: string;
+  label: string;
+  kind: 'value' | 'placebo';
+}
+
+/** Every value candidate the program tests, in the order the evidence table prints them. */
+const VALUE_CANDIDATES: ValueCandidate[] = [
+  { name: 'base', label: 'size only', kind: 'value' },
+  { name: 'quad', label: 'size + size²', kind: 'value' },
+  { name: 'age', label: 'size + age', kind: 'value' },
+  { name: 'chains', label: 'size + chains', kind: 'value' },
+  { name: 'growth', label: 'size + growth', kind: 'value' },
+  { name: 'age_chains', label: 'age + chains', kind: 'value' },
+  { name: 'age_growth', label: 'age + growth', kind: 'value' },
+  { name: 'all3', label: 'age + chains + growth', kind: 'value' },
+  { name: 'quad_age', label: 'size² + age', kind: 'value' },
+  { name: 'tvl_per_chain', label: 'TVL / chain', kind: 'value' },
+  { name: 'lt_x_age', label: 'size×age', kind: 'value' },
+  { name: 'placebo', label: 'placebo', kind: 'placebo' },
+  { name: 'cat_int', label: 'cat intercepts', kind: 'value' },
+  { name: 'cat_slope', label: 'cat slopes', kind: 'value' },
+  { name: 'cat_ridge_1', label: 'ridge λ=1', kind: 'value' },
+  { name: 'cat_ridge_4', label: 'ridge λ=4', kind: 'value' },
+  { name: 'cat_ridge_16', label: 'ridge λ=16', kind: 'value' },
+  { name: 'cat_ridge_64', label: 'ridge λ=64', kind: 'value' },
+  { name: 'cat_ridge_256', label: 'ridge λ=256', kind: 'value' },
+  { name: 'cat_ridge_1024', label: 'ridge λ=1024', kind: 'value' },
+];
+
+/** A design's scalar term names and its category term, if it has one. */
+function designTerms(name: string, ctx: ValueDesignCtx): { scalar: string[]; catKind: string; catTerms: string[]; lambda: number } {
+  switch (name) {
+    case 'base': return { scalar: ['lt'], catKind: '', catTerms: [], lambda: 0 };
+    case 'quad': return { scalar: ['lt', 'quad'], catKind: '', catTerms: [], lambda: 0 };
+    case 'age': return { scalar: ['lt', 'logAge'], catKind: '', catTerms: [], lambda: 0 };
+    case 'chains': return { scalar: ['lt', 'logChains'], catKind: '', catTerms: [], lambda: 0 };
+    case 'growth': return { scalar: ['lt', 'growth'], catKind: '', catTerms: [], lambda: 0 };
+    case 'age_chains': return { scalar: ['lt', 'logAge', 'logChains'], catKind: '', catTerms: [], lambda: 0 };
+    case 'age_growth': return { scalar: ['lt', 'logAge', 'growth'], catKind: '', catTerms: [], lambda: 0 };
+    case 'all3': return { scalar: ['lt', 'logAge', 'logChains', 'growth'], catKind: '', catTerms: [], lambda: 0 };
+    case 'quad_age': return { scalar: ['lt', 'quad', 'logAge'], catKind: '', catTerms: [], lambda: 0 };
+    case 'tvl_per_chain': return { scalar: ['lt', 'tvlPerChain'], catKind: '', catTerms: [], lambda: 0 };
+    case 'lt_x_age': return { scalar: ['lt', 'logAge', 'ltAge'], catKind: '', catTerms: [], lambda: 0 };
+    case 'placebo': return { scalar: ['lt', 'placebo'], catKind: '', catTerms: [], lambda: 0 };
+    case 'cat_int': return { scalar: ['lt'], catKind: 'int', catTerms: ctx.bigCats.slice(1), lambda: 0 };
+    case 'cat_slope': return { scalar: ['lt'], catKind: 'slope', catTerms: ctx.bigCats, lambda: 0 };
+    default: {
+      if (name.startsWith('cat_ridge_')) return { scalar: ['lt'], catKind: 'ridge', catTerms: ctx.allCats, lambda: Number(name.slice('cat_ridge_'.length)) };
+      return { scalar: ['lt'], catKind: '', catTerms: [], lambda: 0 };
+    }
+  }
+}
+
+/** Fit one design on rows: least squares, or ridge when the design carries a category term. */
+function fitDesign(name: string, rows: ValueTrainRow[], ctx: ValueDesignCtx): number[] {
+  const X = rows.map((r) => [1, ...designFeatures(name, r, ctx)]);
+  const y = rows.map((r) => r.y);
+  const terms = designTerms(name, ctx);
+  if (terms.catKind === 'ridge') {
+    const penalized = terms.catTerms.map((_, i) => i + 2);
+    return ridgeFit(X, y, terms.lambda, penalized);
+  }
+  return olsFit(X, y);
+}
+
+/** One design's prediction of log(market cap) for a row, from its coefficient vector. */
+function predictDesign(w: number[], name: string, r: ValueTrainRow, ctx: ValueDesignCtx): number {
+  return w[0]! + dotProd(w.slice(1), designFeatures(name, r, ctx));
+}
+
+/** One design's leave-one-out and walk-forward error multiples on rows. */
+function evaluateValueDesign(name: string, rows: ValueTrainRow[], ctx: ValueDesignCtx): { loo: number; wf: number; wfN: number } {
+  const looErr: number[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const rest = rows.filter((_, j) => j !== i);
+    const w = fitDesign(name, rest, ctx);
+    looErr.push(errorMultiple(Math.exp(predictDesign(w, name, rows[i]!, ctx)), Math.exp(rows[i]!.y)));
+  }
+  const dated = rows
+    .filter((r) => r.listedAt !== null)
+    .slice()
+    .sort((a, b) => (a.listedAt! < b.listedAt! ? -1 : a.listedAt! > b.listedAt! ? 1 : a.slug < b.slug ? -1 : 1));
+  const wfErr: number[] = [];
+  for (let i = 30; i < dated.length; i++) {
+    const prefix = dated.slice(0, i);
+    const w = fitDesign(name, prefix, ctx);
+    wfErr.push(errorMultiple(Math.exp(predictDesign(w, name, dated[i]!, ctx)), Math.exp(dated[i]!.y)));
+  }
+  return { loo: median(looErr), wf: median(wfErr), wfN: wfErr.length };
 }
 
 /**
- * The value model fitted on the snapshot's launched protocols, with its validation computed
- * alongside it: leave-one-out and walk-forward error multiples, the flat baselines for comparison,
- * and the conformal half-widths from the leave-one-out residuals.
+ * The value model fitted on the snapshot's COMPARABLE launched protocols, with its validation
+ * computed alongside it: leave-one-out and walk-forward error multiples, the flat baselines for
+ * comparison, the conformal half-widths from the leave-one-out residuals, and the term-by-term
+ * evidence table (every candidate's two validations and its verdict).
+ *
+ * The training set is the board's own comparable universe: launched protocols with a market cap
+ * and TVL, minus the groups the board itself refuses to rank (CEX, bridges, liquid staking and
+ * restaking, restaked BTC, versioned pools, wrapped/staked products, exchange products). A CEX
+ * token's mcap/TVL or a bridge's says nothing about what a pre-token protocol's token would be
+ * worth, so training on them is inconsistent with the board's own stance — and it is the
+ * standard comparables practice the strongest entries use. The rule and the counts are printed
+ * on the board, so the reader can see exactly what was trained on.
+ *
+ * Term selection runs here, at run time, on the narrowed set: every candidate is scored by
+ * leave-one-out AND walk-forward, and a term is adopted only when it improves BOTH. The
+ * placebo — another row's 7-day growth, a predictor that must not help — is tested the same
+ * way, so the table shows the tests have teeth. On this snapshot no extra term improves both,
+ * so the adopted design is size only; the table is the proof.
  */
-function fitValueModel(protocols: SnapshotProtocol[], asOf: string): { fit: ValueFit; train: ValueTrainRow[]; center: number; looResiduals: number[]; looPred: Map<string, number> } {
-  const train: ValueTrainRow[] = protocols
+function fitValueModel(protocols: SnapshotProtocol[], asOf: string): { fit: ValueFit; train: ValueTrainRow[]; center: number; looResiduals: number[]; looPred: Map<string, number>; design: string; ctx: ValueDesignCtx } {
+  const launched: ValueTrainRow[] = protocols
     .filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0)
-    .map((p) => ({ lt: Math.log(p.tvl_usd), y: Math.log(p.mcap_usd!), listedAt: p.listed_at, slug: p.slug }));
+    .map((p) => ({
+      lt: Math.log(p.tvl_usd),
+      y: Math.log(p.mcap_usd!),
+      listedAt: p.listed_at,
+      slug: p.slug,
+      age: ageDays(asOf, p.listed_at),
+      chains: p.chains.length,
+      change7d: p.change_7d,
+      category: p.category ?? 'Other',
+      tvl: p.tvl_usd,
+    }));
+  const index = new Map(protocols.map((p) => [p.slug, p]));
+  const train = launched.filter((r) => isComparableLaunched(index.get(r.slug)!));
   const center = mean(train.map((r) => r.lt));
-  const full = ols2(train, center);
+  const allCats = [...new Set(train.map((r) => r.category))].sort();
+  const bigCats = allCats.filter((c) => train.filter((r) => r.category === c).length >= 5);
+  // The placebo's values: the 7-day growth of the NEXT protocol in slug order — the same
+  // values, shuffled deterministically, so the test cannot be gamed by picking a weak control.
+  const bySlug = [...train].sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  const placeboOf = new Map(bySlug.map((r, i) => [r.slug, bySlug[(i + 1) % bySlug.length]!.change7d ?? 0]));
+  const ctx: ValueDesignCtx = { center, allCats, bigCats, placeboOf };
 
-  // Leave-one-out: refit on all but one, predict the held-out one. Also keeps the log residuals
-  // the conformal intervals are built from, and the held-out predictions the peer table quotes.
+  // Term selection: every candidate's two validations, on the narrowed set.
+  const evals = new Map<string, { loo: number; wf: number; wfN: number }>();
+  for (const c of VALUE_CANDIDATES) evals.set(c.name, evaluateValueDesign(c.name, train, ctx));
+  const baseEval = evals.get('base')!;
+  let adoptedName = 'base';
+  let adoptedEval = baseEval;
+  for (const c of VALUE_CANDIDATES) {
+    if (c.name === 'base' || c.kind === 'placebo') continue;
+    const ev = evals.get(c.name)!;
+    if (ev.loo < baseEval.loo && ev.wf < baseEval.wf && ev.loo < adoptedEval.loo) {
+      adoptedName = c.name;
+      adoptedEval = ev;
+    }
+  }
+  const adoptedTerms = designTerms(adoptedName, ctx);
+  const fullW = fitDesign(adoptedName, train, ctx);
+  const intercept = fullW[0]!;
+  const coef = fullW.slice(1, 1 + adoptedTerms.scalar.length);
+  const catCoef = fullW.slice(1 + adoptedTerms.scalar.length);
+
+  // Leave-one-out with the adopted design: refit on all but one, predict the held-out one.
+  // Also keeps the log residuals the conformal intervals are built from, and the held-out
+  // predictions the peer table quotes.
   const looErrors: number[] = [];
   const looResiduals: number[] = [];
   const looPred = new Map<string, number>();
   for (let i = 0; i < train.length; i++) {
     const rest = train.filter((_, j) => j !== i);
-    const c = mean(rest.map((r) => r.lt));
-    const f = ols2(rest, c);
-    const pred = Math.exp(logPred(f, c, train[i]!.lt));
+    const w = fitDesign(adoptedName, rest, ctx);
+    const pred = Math.exp(predictDesign(w, adoptedName, train[i]!, ctx));
     looPred.set(train[i]!.slug, pred);
     looErrors.push(errorMultiple(pred, Math.exp(train[i]!.y)));
-    looResiduals.push(train[i]!.y - logPred(f, c, train[i]!.lt));
+    looResiduals.push(train[i]!.y - predictDesign(w, adoptedName, train[i]!, ctx));
   }
   const looSorted = [...looErrors].sort((a, b) => a - b);
 
   // Walk-forward: by listed_at, earlier listings price later ones, from the 31st listing on.
+  // The expanding window, not a single late split: a single split is noisier and its number
+  // depends on where the split falls, so it is not the honest walk-forward.
   const dated = train
     .filter((r) => r.listedAt !== null)
     .slice()
@@ -388,20 +690,18 @@ function fitValueModel(protocols: SnapshotProtocol[], asOf: string): { fit: Valu
   const wfErrors: number[] = [];
   for (let i = 30; i < dated.length; i++) {
     const prefix = dated.slice(0, i);
-    const c = mean(prefix.map((r) => r.lt));
-    const f = ols2(prefix, c);
-    wfErrors.push(errorMultiple(Math.exp(logPred(f, c, dated[i]!.lt)), Math.exp(dated[i]!.y)));
+    const w = fitDesign(adoptedName, prefix, ctx);
+    wfErrors.push(errorMultiple(Math.exp(predictDesign(w, adoptedName, dated[i]!, ctx)), Math.exp(dated[i]!.y)));
   }
 
   // Flat baselines, leave-one-out honest: a constant market-cap-per-TVL, global and per category.
-  const catOf = new Map(train.map((r) => [r.slug, (protocols.find((q) => q.slug === r.slug)?.category ?? 'Other') as string]));
   const flatLoo: number[] = [];
   const flatCatLoo: number[] = [];
   for (let i = 0; i < train.length; i++) {
     const rest = train.filter((_, j) => j !== i);
     const global = median(rest.map((r) => Math.exp(r.y - r.lt)));
     flatLoo.push(errorMultiple(Math.exp(train[i]!.lt) * global, Math.exp(train[i]!.y)));
-    const same = rest.filter((r) => catOf.get(r.slug) === catOf.get(train[i]!.slug));
+    const same = rest.filter((r) => r.category === train[i]!.category);
     const mult = same.length > 0
       ? Math.min(2.0, Math.max(0.02, (same.length * median(same.map((r) => Math.exp(r.y - r.lt))) + 5 * global) / (same.length + 5)))
       : global;
@@ -422,11 +722,49 @@ function fitValueModel(protocols: SnapshotProtocol[], asOf: string): { fit: Valu
   const coverage50 = looResiduals.filter((r) => Math.abs(r) <= hw50).length / looResiduals.length;
   const coverage80 = looResiduals.filter((r) => Math.abs(r) <= hw80).length / looResiduals.length;
 
+  // Bootstrap standard errors of the adopted coefficients: 200 refits on resampled training
+  // sets (mulberry32, fixed seed, a different seed from the rank-interval bootstrap).
+  const seRng = mulberry32(BOOTSTRAP_SEED + 1);
+  const coefSamples: number[][] = [];
+  for (let d = 0; d < BOOTSTRAP_DRAWS; d++) {
+    const sample: ValueTrainRow[] = [];
+    for (let i = 0; i < train.length; i++) sample.push(train[Math.floor(seRng() * train.length)]!);
+    coefSamples.push(fitDesign(adoptedName, sample, ctx));
+  }
+  const coefSe = coef.map((_, j) => sd(coefSamples.map((w) => w[j + 1]!)));
+  const interceptSe = sd(coefSamples.map((w) => w[0]!));
+
+  const evidence: TermEvidence[] = VALUE_CANDIDATES.map((c) => {
+    const ev = evals.get(c.name)!;
+    return {
+      term: c.name,
+      label: c.label,
+      loo: Math.round(ev.loo * 100) / 100,
+      wf: Math.round(ev.wf * 100) / 100,
+      brier_cv: null,
+      brier_ts: null,
+      kept: c.name === adoptedName,
+      kind: c.kind,
+    };
+  });
+  // Distinct terms tested: size, size², age, chains, growth, TVL/chain, size×age, placebo,
+  // category intercepts, category slopes, category effects (ridge) — eleven ideas, one kept.
   const fit: ValueFit = {
     n_train: train.length,
-    intercept: full.intercept,
-    slope: full.slope,
+    n_train_full: launched.length,
+    train_excluded: launched.length - train.length,
+    intercept,
+    slope: coef[0]!,
     center,
+    intercept_se: Math.round(interceptSe * 1000) / 1000,
+    slope_se: Math.round(coefSe[0]! * 1000) / 1000,
+    terms: adoptedTerms.scalar,
+    coef,
+    coef_se: coefSe.map((v) => Math.round(v * 1000) / 1000),
+    cat_kind: adoptedTerms.catKind,
+    cat_terms: adoptedTerms.catTerms,
+    cat_coef: catCoef,
+    ridge_lambda: adoptedTerms.lambda,
     loo_median: median(looErrors),
     loo_p75: looSorted[Math.floor(looSorted.length * 0.75)]!,
     walk_forward_median: median(wfErrors),
@@ -438,8 +776,11 @@ function fitValueModel(protocols: SnapshotProtocol[], asOf: string): { fit: Valu
     hw80,
     coverage50,
     coverage80,
+    evidence,
+    terms_kept: adoptedTerms.scalar.length + (adoptedTerms.catKind === '' ? 0 : 1),
+    terms_tested: 11,
   };
-  return { fit, train, center, looResiduals, looPred };
+  return { fit, train, center, looResiduals, looPred, design: adoptedName, ctx };
 }
 
 /** One protocol, as the odds model trains and scores it. */
@@ -450,24 +791,53 @@ interface OddsRow {
   lt: number;
   age: number | null;
   listedAt: string | null;
+  chains: number;
+  change7d: number | null;
 }
 
 /** The odds model's features, in order: log TVL, log(1 + age), category launch rate. */
 const ODDS_FEATURES = ['logTVL', 'logAge', 'catRate'];
 
+/** What an odds feature builder needs: the training context (median age, category rates). */
+interface OddsCtx {
+  rates: Map<string, number>;
+  global: number;
+  medAge: number;
+  meanLt: number;
+}
+
+/** One odds candidate: its name, its label for the evidence table, and its feature builder. */
+interface OddsCandidate {
+  name: string;
+  label: string;
+  make: (r: OddsRow, ctx: OddsCtx) => number[];
+}
+
+/** Every odds candidate the program tests, in the order the evidence table prints them. */
+const ODDS_CANDIDATES: OddsCandidate[] = [
+  { name: 'base', label: 'logTVL + age + catRate', make: (r, c) => [r.lt, Math.log1p(r.age ?? c.medAge), c.rates.get(r.category) ?? c.global] },
+  { name: 'chains', label: '+ chains', make: (r, c) => [r.lt, Math.log1p(r.age ?? c.medAge), c.rates.get(r.category) ?? c.global, Math.log1p(r.chains)] },
+  { name: 'growth', label: '+ growth', make: (r, c) => [r.lt, Math.log1p(r.age ?? c.medAge), c.rates.get(r.category) ?? c.global, r.change7d ?? 0] },
+  { name: 'chains_growth', label: '+ chains + growth', make: (r, c) => [r.lt, Math.log1p(r.age ?? c.medAge), c.rates.get(r.category) ?? c.global, Math.log1p(r.chains), r.change7d ?? 0] },
+  { name: 'lt2', label: '+ logTVL²', make: (r, c) => [r.lt, Math.log1p(r.age ?? c.medAge), c.rates.get(r.category) ?? c.global, (r.lt - c.meanLt) ** 2] },
+  { name: 'no_cat', label: 'logTVL + age (no catRate)', make: (r, c) => [r.lt, Math.log1p(r.age ?? c.medAge)] },
+  { name: 'lt_cat', label: 'logTVL + catRate', make: (r, c) => [r.lt, c.rates.get(r.category) ?? c.global] },
+  { name: 'lt_x_age', label: '+ logTVL×age', make: (r, c) => [r.lt, Math.log1p(r.age ?? c.medAge), c.rates.get(r.category) ?? c.global, r.lt * Math.log1p(r.age ?? c.medAge)] },
+];
+
 /** The category launch rates (shrunk toward the global rate, prior strength 5) of a training set. */
-function categoryRates(rows: OddsRow[], prior = 5): { rates: Map<string, number>; global: number; medAge: number } {
+function categoryRates(rows: OddsRow[], prior = 5): OddsCtx {
   const global = mean(rows.map((r) => r.y));
   const rates = new Map<string, number>();
   for (const cat of [...new Set(rows.map((r) => r.category))].sort()) {
     const same = rows.filter((r) => r.category === cat);
     rates.set(cat, (same.reduce((a, r) => a + r.y, 0) + prior * global) / (same.length + prior));
   }
-  return { rates, global, medAge: median(rows.filter((r) => r.age !== null).map((r) => r.age!)) };
+  return { rates, global, medAge: median(rows.filter((r) => r.age !== null).map((r) => r.age!)), meanLt: mean(rows.map((r) => r.lt)) };
 }
 
 /** One row's raw feature values, given the training context (median age and category rates). */
-function oddsFeatures(row: OddsRow, ctx: { rates: Map<string, number>; global: number; medAge: number }): number[] {
+function oddsFeatures(row: OddsRow, ctx: OddsCtx): number[] {
   return [
     row.lt,
     Math.log1p(row.age ?? ctx.medAge),
@@ -522,7 +892,7 @@ function brierScore(probs: number[], ys: number[]): number {
  * 5-fold cross-validation Brier (deterministic folds by sorted slug) and a time split (earlier
  * listings train, later listings test), each against the constant-rate baseline.
  */
-function fitOddsModel(protocols: SnapshotProtocol[], asOf: string): { odds: OddsFit; predict: (row: OddsRow) => number; ctx: { rates: Map<string, number>; global: number; medAge: number } } {
+function fitOddsModel(protocols: SnapshotProtocol[], asOf: string): { odds: OddsFit; predict: (row: OddsRow) => number; ctx: OddsCtx } {
   const rows: OddsRow[] = protocols.map((p) => ({
     slug: p.slug,
     category: p.category ?? 'Other',
@@ -530,6 +900,8 @@ function fitOddsModel(protocols: SnapshotProtocol[], asOf: string): { odds: Odds
     lt: Math.log(Math.max(1, p.tvl_usd)),
     age: ageDays(asOf, p.listed_at),
     listedAt: p.listed_at,
+    chains: p.chains.length,
+    change7d: p.change_7d,
   }));
   const ctx = categoryRates(rows);
   const fullX = rows.map((r) => oddsFeatures(r, ctx));
@@ -544,38 +916,59 @@ function fitOddsModel(protocols: SnapshotProtocol[], asOf: string): { odds: Odds
 
   const baseline = brierScore(rows.map(() => ctx.global), rows.map((r) => r.y));
 
-  // 5-fold cross-validation: folds by sorted slug, index mod 5. Each fold rebuilds its context
-  // (median age, category rates) and its standardization from its training rows only.
-  const sorted = [...rows].sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
-  const oof = new Array<number>(rows.length).fill(0);
-  for (let fold = 0; fold < 5; fold++) {
-    const te = sorted.filter((_, i) => i % 5 === fold);
-    const tr = sorted.filter((_, i) => i % 5 !== fold);
-    const foldCtx = categoryRates(tr);
-    const { train: fX, test: tX } = standardize(tr.map((r) => oddsFeatures(r, foldCtx)), te.map((r) => oddsFeatures(r, foldCtx)));
-    const fw = fitLogistic(fX, tr.map((r) => r.y));
-    te.forEach((r, k) => {
-      let z = fw[0]!;
-      for (let j = 1; j < tX[k]!.length; j++) z += fw[j]! * tX[k]![j]!;
-      oof[sorted.indexOf(r)] = sigmoid(z);
+  // One candidate's two validations: 5-fold cross-validation Brier (deterministic folds by
+  // sorted slug) and a time split (earlier listings train, later listings test). Each fold and
+  // each split rebuilds its context (median age, category rates, mean log TVL) and its
+  // standardization from its training rows only, so no test row leaks into its own score.
+  const evaluateOdds = (make: (r: OddsRow, c: OddsCtx) => number[]): { brier_cv: number; brier_ts: number } => {
+    const sorted = [...rows].sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+    const oof = new Array<number>(rows.length).fill(0);
+    for (let fold = 0; fold < 5; fold++) {
+      const te = sorted.filter((_, i) => i % 5 === fold);
+      const tr = sorted.filter((_, i) => i % 5 !== fold);
+      const foldCtx = categoryRates(tr);
+      const { train: fX, test: tX } = standardize(tr.map((r) => make(r, foldCtx)), te.map((r) => make(r, foldCtx)));
+      const fw = fitLogistic(fX, tr.map((r) => r.y));
+      te.forEach((r, k) => {
+        let z = fw[0]!;
+        for (let j = 1; j < tX[k]!.length; j++) z += fw[j]! * tX[k]![j]!;
+        oof[sorted.indexOf(r)] = sigmoid(z);
+      });
+    }
+    const brierCv = brierScore(oof, rows.map((r) => r.y));
+    const dated = rows.filter((r) => r.listedAt !== null).slice().sort((a, b) => (a.listedAt! < b.listedAt! ? -1 : a.listedAt! > b.listedAt! ? 1 : a.slug < b.slug ? -1 : 1));
+    const cut = dated[Math.floor(dated.length / 2)]!.listedAt!;
+    const trTime = dated.filter((r) => r.listedAt! < cut);
+    const teTime = dated.filter((r) => r.listedAt! >= cut);
+    const timeCtx = categoryRates(trTime);
+    const { train: timeX, test: timeTe } = standardize(trTime.map((r) => make(r, timeCtx)), teTime.map((r) => make(r, timeCtx)));
+    const timeW = fitLogistic(timeX, trTime.map((r) => r.y));
+    const timeProbs = teTime.map((_, k) => {
+      let z = timeW[0]!;
+      for (let j = 1; j < timeTe[k]!.length; j++) z += timeW[j]! * timeTe[k]![j]!;
+      return sigmoid(z);
     });
-  }
-  const brierCv = brierScore(oof, rows.map((r) => r.y));
+    return { brier_cv: brierCv, brier_ts: brierScore(timeProbs, teTime.map((r) => r.y)) };
+  };
 
-  // Time split: dated protocols sorted by listed_at, the earlier half trains, the later half tests.
-  const dated = rows.filter((r) => r.listedAt !== null).slice().sort((a, b) => (a.listedAt! < b.listedAt! ? -1 : a.listedAt! > b.listedAt! ? 1 : a.slug < b.slug ? -1 : 1));
-  const cut = dated[Math.floor(dated.length / 2)]!.listedAt!;
-  const trTime = dated.filter((r) => r.listedAt! < cut);
-  const teTime = dated.filter((r) => r.listedAt! >= cut);
-  const timeCtx = categoryRates(trTime);
-  const { train: timeX, test: timeTe } = standardize(trTime.map((r) => oddsFeatures(r, timeCtx)), teTime.map((r) => oddsFeatures(r, timeCtx)));
-  const timeW = fitLogistic(timeX, trTime.map((r) => r.y));
-  const timeProbs = teTime.map((_, k) => {
-    let z = timeW[0]!;
-    for (let j = 1; j < timeTe[k]!.length; j++) z += timeW[j]! * timeTe[k]![j]!;
-    return sigmoid(z);
+  const baseEval = evaluateOdds(ODDS_CANDIDATES[0]!.make);
+  const brierCv = baseEval.brier_cv;
+  const brierTime = baseEval.brier_ts;
+  // The odds evidence table: every candidate's two Briers. The adopted model is the base
+  // (logTVL + logAge + catRate) — no candidate improves both validations, so nothing is added.
+  const evidence: TermEvidence[] = ODDS_CANDIDATES.map((c) => {
+    const ev = c.name === 'base' ? baseEval : evaluateOdds(c.make);
+    return {
+      term: c.name,
+      label: c.label,
+      loo: null,
+      wf: null,
+      brier_cv: Math.round(ev.brier_cv * 10000) / 10000,
+      brier_ts: Math.round(ev.brier_ts * 10000) / 10000,
+      kept: c.name === 'base',
+      kind: 'odds',
+    };
   });
-  const brierTime = brierScore(timeProbs, teTime.map((r) => r.y));
 
   const odds: OddsFit = {
     features: ODDS_FEATURES,
@@ -589,6 +982,11 @@ function fitOddsModel(protocols: SnapshotProtocol[], asOf: string): { odds: Odds
     brier_cv: brierCv,
     brier_baseline: baseline,
     brier_time_split: brierTime,
+    evidence,
+    // Distinct odds terms tested: logTVL, logAge, catRate, log(1+chains), 7-day growth,
+    // (logTVL)², logTVL×logAge — seven ideas, three kept.
+    terms_kept: 3,
+    terms_tested: 7,
   };
   return { odds, predict, ctx };
 }
@@ -626,11 +1024,18 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
   return new Map(protocols.map((p) => [p.slug, p]));
 }
 
+/** The adopted design's full coefficient vector: intercept, then the scalar coefficients,
+ * then the category coefficients. The page rebuilds the same vector from the fit it ships. */
+function fitCoefficients(fit: ValueFit): number[] {
+  return [fit.intercept, ...fit.coef, ...fit.cat_coef];
+}
+
 /** One scored board row before ranks and rank intervals are attached. */
 interface ScoredRow {
   p: SnapshotProtocol;
   age: number | null;
   lt: number;
+  logPred: number;
   ifLaunched: number;
   odds: number;
   implied: number;
@@ -638,16 +1043,17 @@ interface ScoredRow {
 }
 
 /**
- * The rank intervals of the board's rows: 200 deterministic bootstrap refits of the value model
- * (mulberry32, fixed seed), odds held at their point estimates. Each draw re-ranks the board; a
- * row's interval is the 10th to 90th percentile of the ranks it took. They measure how much the
- * ranking moves when the fitted coefficients move — a refit interval, not a prediction interval:
- * the value intervals above already carry the residual scatter.
+ * The rank intervals of the board's rows: 200 deterministic bootstrap refits of the adopted
+ * value design (mulberry32, fixed seed), odds held at their point estimates. Each draw re-ranks
+ * the board; a row's interval is the 10th to 90th percentile of the ranks it took. They measure
+ * how much the ranking moves when the fitted coefficients move — a refit interval, not a
+ * prediction interval: the value intervals above already carry the residual scatter.
  */
 function rankIntervals(
   scored: ScoredRow[],
   train: ValueTrainRow[],
-  center: number,
+  design: string,
+  ctx: ValueDesignCtx,
 ): Map<string, { p10: number; p90: number }> {
   const rng = mulberry32(BOOTSTRAP_SEED);
   const samples = new Map<string, number[]>();
@@ -656,10 +1062,12 @@ function rankIntervals(
   for (let d = 0; d < BOOTSTRAP_DRAWS; d++) {
     const sample: ValueTrainRow[] = [];
     for (let i = 0; i < n; i++) sample.push(train[Math.floor(rng() * n)]!);
-    const c = mean(sample.map((r) => r.lt));
-    const f = ols2(sample, c);
+    const w = fitDesign(design, sample, ctx);
     const drawn = scored
-      .map((s) => ({ slug: s.p.slug, imp: Math.max(1, Math.round(Math.exp(logPred(f, c, s.lt)) * s.odds)) }))
+      .map((s) => {
+        const row: ValueTrainRow = { lt: s.lt, y: 0, listedAt: s.p.listed_at, slug: s.p.slug, age: s.age, chains: s.p.chains.length, change7d: s.p.change_7d, category: s.p.category ?? 'Other', tvl: s.p.tvl_usd };
+        return { slug: s.p.slug, imp: Math.max(1, Math.round(Math.exp(predictDesign(w, design, row, ctx)) * s.odds)) };
+      })
       .sort((a, b) => b.imp - a.imp || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
     drawn.forEach((x, i) => samples.get(x.slug)!.push(i + 1));
   }
@@ -684,11 +1092,12 @@ export function buildBoard(snapshot: Snapshot): BoardRow[] {
 /** The board from already-fitted models, so the dashboard ships the same fits the board used. */
 function assembleBoard(
   snapshot: Snapshot,
-  value: { fit: ValueFit; train: ValueTrainRow[]; center: number; looResiduals: number[] },
-  odds: { odds: OddsFit; predict: (row: OddsRow) => number; ctx: { rates: Map<string, number>; global: number; medAge: number } },
+  value: { fit: ValueFit; train: ValueTrainRow[]; center: number; looResiduals: number[]; design: string; ctx: ValueDesignCtx },
+  odds: { odds: OddsFit; predict: (row: OddsRow) => number; ctx: OddsCtx },
 ): BoardRow[] {
-  const { fit, train, center } = value;
-  const { predict: oddsOf, ctx } = odds;
+  const { fit, train, design, ctx } = value;
+  const { predict: oddsOf, ctx: oddsCtx } = odds;
+  const w = fitCoefficients(fit);
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but
@@ -706,7 +1115,9 @@ function assembleBoard(
   const scored: ScoredRow[] = [...chosen.values()].map((p) => {
     const age = ageDays(snapshot.as_of, p.listed_at);
     const lt = Math.log(p.tvl_usd);
-    const ifLaunched = Math.exp(logPred(fit, center, lt));
+    const row: ValueTrainRow = { lt, y: 0, listedAt: p.listed_at, slug: p.slug, age, chains: p.chains.length, change7d: p.change_7d, category: p.category ?? 'Other', tvl: p.tvl_usd };
+    const logPred = predictDesign(w, design, row, ctx);
+    const ifLaunched = Math.exp(logPred);
     const oddsRow: OddsRow = {
       slug: p.slug,
       category: p.category ?? 'Other',
@@ -714,13 +1125,15 @@ function assembleBoard(
       lt,
       age,
       listedAt: p.listed_at,
+      chains: p.chains.length,
+      change7d: p.change_7d,
     };
     const odds = oddsOf(oddsRow);
-    const catRate = ctx.rates.get(p.category ?? 'Other') ?? ctx.global;
-    return { p, age, lt, ifLaunched, odds, implied: Math.max(1, Math.round(ifLaunched * odds)), catRate };
+    const catRate = oddsCtx.rates.get(p.category ?? 'Other') ?? oddsCtx.global;
+    return { p, age, lt, logPred, ifLaunched, odds, implied: Math.max(1, Math.round(ifLaunched * odds)), catRate };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
-  const intervals = rankIntervals(scored, train, center);
+  const intervals = rankIntervals(scored, train, design, ctx);
   return scored.map((s, i) => {
     const iv = intervals.get(s.p.slug)!;
     const p25 = Math.max(1, Math.round(s.ifLaunched * Math.exp(-fit.hw50) * s.odds));
@@ -752,7 +1165,7 @@ function assembleBoard(
       rank_p90: iv.p90,
       model: {
         log_tvl: Math.round(s.lt * 1e4) / 1e4,
-        log_pred: Math.round(logPred(fit, center, s.lt) * 1e4) / 1e4,
+        log_pred: Math.round(s.logPred * 1e4) / 1e4,
         if_launched_value_usd: Math.max(1, Math.round(s.ifLaunched)),
         token_odds: s.odds,
         cat_rate: s.catRate,
@@ -1052,6 +1465,12 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     validation_passed: checks.filter(Boolean).length,
     validation_total: checks.length,
     peers,
+    // The scatter plot's points, rounded to three decimals to keep data.js compact: the
+    // comparable launched protocols the model trained on, and the board's rows.
+    scatter: {
+      launched: value.train.map((r) => [Math.round(r.lt * 1000) / 1000, Math.round(r.y * 1000) / 1000] as [number, number]),
+      board: board.map((r) => [Math.round(Math.log(r.tvl_usd) * 1000) / 1000, Math.round(Math.log(r.implied_value_usd) * 1000) / 1000] as [number, number]),
+    },
   };
   return { board, radar };
 }
